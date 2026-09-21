@@ -1,14 +1,23 @@
 //! 分类与标签的纯逻辑。
 //!
 //! 两者共用同一套「名字」规则：名字就是身份，比较时忽略大小写，存下来的是第一次
-//! 出现的写法。区别只在归属关系——一个仓库最多属于一个分类，可以挂任意多个标签。
+//! 出现的写法。区别在归属——一个仓库最多属于一个分类，可以挂任意多个标签。
 //!
-//! 这里不碰 `Library`、也不碰界面：输入字符串、输出判断，好测。
-
-use std::collections::HashSet;
+//! **分类是一棵树**，树本身在 [`super::tree`] 里；这里只管名字和路径语法：
+//! 用户输入 `开发/前端` 时怎么把这条路径收干净，以及从路径里切出各级名字。
+//! 树上的父子关系不从这里推断——那是 `parent_id` 的事。
+//!
+//! 标签是扁平的，所以只需要名字规则，外加一个稳定的 id（改标签名时不必回头改
+//! 仓库上的一堆引用）。
 
 /// 名字的长度上限。它是一行给人看的字，超过这个长度一定是误输入。
 pub const MAX_NAME_CHARS: usize = 40;
+
+/// 分类路径的分隔符。全角 `／` 在清洗时会被换成它。
+pub const PATH_SEPARATOR: char = '/';
+
+/// 分类最多几级。再深就不是「归类」而是「重新发明目录树」了。
+pub const MAX_DEPTH: usize = 6;
 
 /// 词表的两个种类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +34,21 @@ impl TaxonomyKind {
             Self::Tag => "标签",
         }
     }
+
+    /// 这一种支不支持层级。只有分类支持：标签是横着贴的，分层没有意义。
+    pub fn is_hierarchical(self) -> bool {
+        matches!(self, Self::Category)
+    }
+}
+
+/// 一个标签。
+///
+/// 它仍然是扁平的，但有一个稳定 id：仓库与标签的关联落在 `repo_tags` 上，
+/// 靠 id 关联，所以改标签名不用回头改每一处引用。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
 }
 
 /// 加名字的结果。
@@ -35,6 +59,8 @@ pub enum AddName {
     AlreadyPresent,
     /// 空名字或超过 [`MAX_NAME_CHARS`]。
     Invalid,
+    /// 写库失败，这次改动整个丢了。界面上另有提示说明原因（一般是磁盘或权限）。
+    Failed,
 }
 
 /// 改名字的结果。
@@ -49,6 +75,10 @@ pub enum RenameName {
     NotFound,
     /// 新名字不合法。
     Invalid,
+    /// 分类改到了它自己的下级里，树会断成一个环。
+    Circular,
+    /// 写库失败，这次改动整个丢了。
+    Failed,
 }
 
 /// 收干净用户输入的名字。返回 `None` 表示这个名字不能用。
@@ -68,7 +98,7 @@ pub fn same_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
-/// 在词表里找名字，返回它的下标。
+/// 在扁平词表里找名字，返回它的下标。
 pub fn index_of(names: &[String], name: &str) -> Option<usize> {
     names.iter().position(|existing| same_name(existing, name))
 }
@@ -89,13 +119,46 @@ pub fn push_new(names: &mut Vec<String>, raw: &str) -> bool {
     true
 }
 
-/// 词表自身去重，保留第一次出现的写法。手改过 `library.json` 之后用得上。
-/// 返回是否真的去掉过东西。
-pub fn dedupe(names: &mut Vec<String>) -> bool {
-    let before = names.len();
-    let mut seen = HashSet::new();
-    names.retain(|name| seen.insert(name.to_lowercase()));
-    names.len() != before
+// ---- 路径语法 ----
+
+/// 把一条路径拆成各级名字。空段直接丢掉，所以 `""` 会得到空列表。
+pub fn segments(path: &str) -> Vec<String> {
+    path.split(PATH_SEPARATOR)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 由各级名字拼回一条路径。
+pub fn join_path(parts: &[String]) -> String {
+    parts.join(&PATH_SEPARATOR.to_string())
+}
+
+/// 收干净用户输入的一条分类路径：逐级清洗，任何一级不合法整条就不合法。
+///
+/// 两端的空白和多余的分隔符会去掉（`"开发/"` 就是 `"开发"`），但中间的空段
+/// （`"开发//前端"`）算误输入——多半是多敲了一个斜杠，不如让他看见。
+pub fn clean_path(raw: &str) -> Option<String> {
+    let normalized = raw.replace('／', &PATH_SEPARATOR.to_string());
+    let trimmed = normalized.trim_matches(|c: char| c.is_whitespace() || c == PATH_SEPARATOR);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<String> = trimmed
+        .split(PATH_SEPARATOR)
+        .map(clean_name)
+        .collect::<Option<Vec<_>>>()?;
+    if parts.len() > MAX_DEPTH {
+        return None;
+    }
+    Some(join_path(&parts))
+}
+
+/// 去重用的键：名字的小写形式。库里 `name_key` 列存的就是它。
+pub fn name_key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 /// 分类的色相（0..360）。同一个名字永远得到同一个色相，相邻的名字也不会挤在
@@ -114,6 +177,7 @@ pub fn hue_seed(name: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| name.to_string()).collect()
@@ -131,7 +195,10 @@ mod tests {
         assert_eq!(clean_name(""), None);
         assert_eq!(clean_name("   "), None);
         assert_eq!(clean_name("　"), None, "全角空格也是空白");
-        assert_eq!(clean_name(&"x".repeat(MAX_NAME_CHARS)), Some("x".repeat(MAX_NAME_CHARS)));
+        assert_eq!(
+            clean_name(&"x".repeat(MAX_NAME_CHARS)),
+            Some("x".repeat(MAX_NAME_CHARS))
+        );
         assert_eq!(clean_name(&"x".repeat(MAX_NAME_CHARS + 1)), None);
     }
 
@@ -164,12 +231,39 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_keeps_the_first_of_each_spelling() {
-        let mut list = names(&["AI", "ai", "命令行", "命令行"]);
-        assert!(dedupe(&mut list), "去掉过东西就要说去掉过");
-        assert_eq!(list, names(&["AI", "命令行"]));
+    fn clean_path_cleans_each_level() {
+        assert_eq!(clean_path("开发/前端").as_deref(), Some("开发/前端"));
+        assert_eq!(clean_path("  开发 / 前端  ").as_deref(), Some("开发/前端"));
+        assert_eq!(clean_path("开发/  前端  框架").as_deref(), Some("开发/前端 框架"));
+        assert_eq!(clean_path("／开发／前端").as_deref(), Some("开发/前端"), "全角斜杠也认");
+        assert_eq!(clean_path("开发/").as_deref(), Some("开发"), "结尾多敲的斜杠不算错");
+        assert_eq!(clean_path("开发").as_deref(), Some("开发"));
+    }
 
-        assert!(!dedupe(&mut list), "已经是干净的就不该再报改动");
+    #[test]
+    fn clean_path_rejects_what_cannot_be_a_category() {
+        assert_eq!(clean_path(""), None);
+        assert_eq!(clean_path("  /  "), None);
+        assert_eq!(clean_path("开发//前端"), None, "中间的空段多半是多敲了斜杠");
+        assert_eq!(
+            clean_path(&format!("开发/{}", "x".repeat(MAX_NAME_CHARS + 1))),
+            None,
+            "哪一级太长整条都不合法"
+        );
+        let deep = (0..=MAX_DEPTH)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert_eq!(clean_path(&deep), None, "超过层级上限");
+        assert!(clean_path(&format!("开发/{}", "x".repeat(MAX_NAME_CHARS))).is_some());
+    }
+
+    #[test]
+    fn a_path_splits_into_its_levels() {
+        assert_eq!(segments("开发/前端/框架"), names(&["开发", "前端", "框架"]));
+        assert_eq!(segments(""), Vec::<String>::new());
+        assert_eq!(segments("开发//前端"), names(&["开发", "前端"]), "空段直接跳过");
+        assert_eq!(join_path(&names(&["开发", "前端"])), "开发/前端");
     }
 
     #[test]

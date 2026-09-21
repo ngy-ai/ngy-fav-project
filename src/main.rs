@@ -4,6 +4,7 @@
 //! `repos` / `taxonomy` / `discovery` / `settings`（领域与界面）→ `app`（外壳）。
 
 mod app;
+pub mod db;
 pub mod discovery;
 pub mod github;
 pub mod library;

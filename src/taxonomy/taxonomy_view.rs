@@ -1,7 +1,8 @@
-//! 「分类与标签」页：管词表本身。
+//! 词表管理页：管词表本身。
 //!
-//! 仓库上的归属在仓库页编辑，这里只管「有哪些分类、有哪些标签」。改名和删除都会
-//! 跟着改到仓库上，所以删除前先把会影响到几个仓库说清楚。
+//! 一个词表一个页面，`kind` 决定这一页管分类还是标签——两边的规则完全一样，
+//! 分开的只是入口。仓库上的归属在仓库页编辑，这里只管「有哪些名字」。改名和
+//! 删除都会跟着改到仓库上，所以删除前先把会影响到几个仓库说清楚。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -44,77 +45,72 @@ impl Palette {
     }
 }
 
-/// 词表里的一项：名字 + 有多少仓库在用。
+/// 词表里的一项：名字 + 有多少仓库在用 + 在树里的位置。
 struct NameRow {
+    /// 完整路径。分类是 `开发/前端`，标签就是一个名字。
     name: String,
+    /// 显示成色块的那个字：分类是末级名字（缩进已经说明了层级），标签就是名字。
+    leaf: String,
+    /// 用了这个分类／标签的仓库数。分类按**整棵子树**算。
     used_by: usize,
+    /// 层级，顶层是 1。缩进按它算；标签恒为 1。
+    depth: usize,
+    /// 直接子分类数量；标签恒为 0。
+    children: usize,
 }
 
 pub struct TaxonomyView {
     library: Entity<Library>,
-    /// 两个词表各一个输入框。和「添加仓库」同样是长期持有的实体。
-    category_input: Entity<InputState>,
-    tag_input: Entity<InputState>,
+    /// 这一页管哪个词表。分类页和标签页是同一种视图的两份实例。
+    kind: TaxonomyKind,
+    /// 新建名字的输入框。和「添加仓库」同样是长期持有的实体。
+    input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TaxonomyView {
     pub fn new(
         library: Entity<Library>,
+        kind: TaxonomyKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let category_input = cx.new(|cx| {
+        let input = cx.new(|cx| {
+            let placeholder = if kind.is_hierarchical() {
+                // 一个输入框就够：路径里带上上级，缺的上级会自动建。
+                "新分类，用 / 分层，如 开发/前端".to_string()
+            } else {
+                "新标签，回车添加".to_string()
+            };
             InputState::new(window, cx)
-                .placeholder("新分类，回车添加")
-                .submit_on_enter(true)
-        });
-        let tag_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("新标签，回车添加")
+                .placeholder(placeholder)
                 .submit_on_enter(true)
         });
 
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.observe(&library, |_, _, cx| cx.notify()));
-        subscriptions.push(cx.subscribe_in(
-            &category_input,
-            window,
-            |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.add(TaxonomyKind::Category, window, cx);
-                }
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
-            &tag_input,
-            window,
-            |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.add(TaxonomyKind::Tag, window, cx);
-                }
-            },
-        ));
+        subscriptions.push(cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.add(window, cx);
+            }
+        }));
 
         Self {
             library,
-            category_input,
-            tag_input,
+            kind,
+            input,
             _subscriptions: subscriptions,
         }
     }
 
-    fn add(&mut self, kind: TaxonomyKind, window: &mut Window, cx: &mut Context<Self>) {
-        let input = match kind {
-            TaxonomyKind::Category => &self.category_input,
-            TaxonomyKind::Tag => &self.tag_input,
-        };
+    fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.kind;
+        let input = &self.input;
         let raw = input.read(cx).value().to_string();
 
         let outcome = self.library.update(cx, |library, cx| {
             let outcome = library.add_name(kind, &raw);
             if outcome == AddName::Added {
-                library.persist();
                 cx.notify();
             }
             outcome
@@ -123,7 +119,7 @@ impl TaxonomyView {
         match outcome {
             AddName::Added => {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
-                let name = tax::clean_name(&raw).unwrap_or_default();
+                let name = cleaned_for(kind, &raw).unwrap_or_default();
                 window.push_notification(
                     Notification::success(format!("已添加{}「{name}」", kind.label())),
                     cx,
@@ -134,33 +130,46 @@ impl TaxonomyView {
                 cx,
             ),
             AddName::Invalid => window.push_notification(Notification::error(invalid_note(kind)), cx),
+            AddName::Failed => window.push_notification(Notification::error(write_failed_note()), cx),
         }
     }
 
-    fn rows(&self, kind: TaxonomyKind, cx: &Context<Self>) -> Vec<NameRow> {
+    /// 按显示顺序铺平词表。
+    ///
+    /// 分类的顺序、层级、子分类数都是树的投影，一次 `category_rows` 全拿到；
+    /// 标签是扁平的，本身就已经是显示顺序。
+    fn rows(&self, cx: &Context<Self>) -> Vec<NameRow> {
         let library = self.library.read(cx);
-        library
-            .names(kind)
-            .iter()
-            .map(|name| NameRow {
-                name: name.clone(),
-                used_by: library.repo_count_using(kind, name),
-            })
-            .collect()
+        if self.kind.is_hierarchical() {
+            library
+                .category_rows()
+                .into_iter()
+                .map(|row| NameRow {
+                    name: row.path,
+                    leaf: row.leaf,
+                    used_by: row.repos,
+                    depth: row.depth,
+                    children: row.children,
+                })
+                .collect()
+        } else {
+            library
+                .tags()
+                .iter()
+                .map(|tag| NameRow {
+                    name: tag.name.clone(),
+                    leaf: tag.name.clone(),
+                    used_by: library.repo_count_using(TaxonomyKind::Tag, &tag.name),
+                    depth: 1,
+                    children: 0,
+                })
+                .collect()
+        }
     }
 
-    fn render_section(
-        &self,
-        kind: TaxonomyKind,
-        note: &str,
-        palette: &Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let rows = self.rows(kind, cx);
-        let input = match kind {
-            TaxonomyKind::Category => &self.category_input,
-            TaxonomyKind::Tag => &self.tag_input,
-        };
+    fn render_body(&self, palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let kind = self.kind;
+        let rows = self.rows(cx);
         let add_id: ElementId = match kind {
             TaxonomyKind::Category => "add-category".into(),
             TaxonomyKind::Tag => "add-tag".into(),
@@ -171,7 +180,7 @@ impl TaxonomyView {
         let entries: Vec<AnyElement> = rows
             .into_iter()
             .enumerate()
-            .map(|(index, row)| self.render_row(kind, row, index == last, palette))
+            .map(|(index, row)| self.render_row(row, index == last, palette))
             .collect();
 
         let table = (!entries.is_empty()).then(|| {
@@ -192,7 +201,7 @@ impl TaxonomyView {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(kind.label()),
+                            .child(format!("全部{}", kind.label())),
                     )
                     .child(
                         div()
@@ -201,18 +210,17 @@ impl TaxonomyView {
                             .child(format!("{count} 个")),
                     ),
             )
-            .child(div().text_xs().text_color(palette.muted).child(note.to_string()))
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(input)))
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.input)))
                     .child(
                         Button::new(add_id)
                             .icon(IconName::Plus)
                             .label("添加")
                             .outline()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.add(kind, window, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add(window, cx);
                             })),
                     ),
             )
@@ -230,20 +238,19 @@ impl TaxonomyView {
                             div()
                                 .text_xs()
                                 .text_color(palette.muted)
-                                .child("在上面输入一个名字就能建，也可以在仓库详情里直接新建"),
+                                .child(if kind.is_hierarchical() {
+                                    "在上面输入一个分类名就能建；写「开发/前端」会把上级一起建上"
+                                } else {
+                                    "在上面输入一个名字就能建，也可以在仓库详情里直接新建"
+                                }),
                         ),
                 )
             })
             .into_any_element()
     }
 
-    fn render_row(
-        &self,
-        kind: TaxonomyKind,
-        row: NameRow,
-        is_last: bool,
-        palette: &Palette,
-    ) -> AnyElement {
+    fn render_row(&self, row: NameRow, is_last: bool, palette: &Palette) -> AnyElement {
+        let kind = self.kind;
         let name = row.name.clone();
         let rename_id: ElementId = match kind {
             TaxonomyKind::Category => format!("rename-category:{}", row.name).into(),
@@ -254,21 +261,38 @@ impl TaxonomyView {
             TaxonomyKind::Tag => format!("delete-tag:{}", row.name).into(),
         };
 
+        // 层级靠缩进表达，比画线省事，也不会把文字挤走。
+        let indent = 12. + (row.depth.saturating_sub(1) as f32) * 18.;
+        // 沿用别人的分类来新建下级：上级已经在手边，不用再打一遍路径。
+        let add_child_id: ElementId = format!("add-child:{}", row.name).into();
+
         h_flex()
             .w_full()
             .gap_3()
             .justify_between()
-            .px_3()
+            .pr_3()
+            .pl(px(indent))
             .py_2()
             .when(!is_last, |this| this.border_b_1().border_color(palette.border))
             .child(match kind {
-                TaxonomyKind::Category => chip::category_tag(&row.name, palette.dark).into_any_element(),
-                TaxonomyKind::Tag => chip::tag_tag(&row.name).into_any_element(),
+                // 缩进已经说明了它是谁的子级，这里只画末级名字；颜色仍取自整条路径。
+                TaxonomyKind::Category => {
+                    chip::category_leaf_tag(&row.name, &row.leaf, palette.dark).into_any_element()
+                }
+                TaxonomyKind::Tag => chip::tag_tag(&row.leaf).into_any_element(),
             })
             .child(
                 h_flex()
                     .gap_1()
                     .flex_shrink_0()
+                    .when(row.children > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(palette.muted)
+                                .child(format!("{} 个子分类", row.children)),
+                        )
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -279,12 +303,37 @@ impl TaxonomyView {
                                 format!("{} 个仓库", row.used_by)
                             }),
                     )
+                    .when(kind.is_hierarchical(), |this| {
+                        this.child(
+                            Button::new(add_child_id)
+                                .icon(IconName::FolderPlus)
+                                .ghost()
+                                .small()
+                                .tooltip("在它下面新建子分类")
+                                .on_click({
+                                    let library = self.library.clone();
+                                    let name = name.clone();
+                                    move |_, window, cx| {
+                                        open_new_child_dialog(
+                                            library.clone(),
+                                            name.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                    })
                     .child(
                         Button::new(rename_id)
                             .icon(IconName::Pencil)
                             .ghost()
                             .small()
-                            .tooltip("改名（仓库上的引用会一起改）")
+                            .tooltip(if kind.is_hierarchical() {
+                                "改名或改路径（子分类与仓库引用一起走）"
+                            } else {
+                                "改名（仓库上的引用会一起改）"
+                            })
                             .on_click({
                                 let library = self.library.clone();
                                 let name = name.clone();
@@ -323,26 +372,14 @@ impl TaxonomyView {
 impl Render for TaxonomyView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::of(cx);
-        let (categories, tags) = {
-            let library = self.library.read(cx);
-            (
-                library.names(TaxonomyKind::Category).len(),
-                library.names(TaxonomyKind::Tag).len(),
-            )
+        let kind = self.kind;
+        let count = self.library.read(cx).names(kind).len();
+        let body = self.render_body(&palette, cx);
+        // 滚动方法在 `Stateful<Div>` 上，先给容器一个稳定 id。
+        let scroll_id: ElementId = match kind {
+            TaxonomyKind::Category => "category-scroll".into(),
+            TaxonomyKind::Tag => "tag-scroll".into(),
         };
-
-        let category_section = self.render_section(
-            TaxonomyKind::Category,
-            "一个仓库最多只属于一个分类。",
-            &palette,
-            cx,
-        );
-        let tag_section = self.render_section(
-            TaxonomyKind::Tag,
-            "标签可以挂多个，一个仓库挂多少个都行。",
-            &palette,
-            cx,
-        );
 
         v_flex()
             .size_full()
@@ -359,41 +396,47 @@ impl Render for TaxonomyView {
                         div()
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("分类与标签"),
+                            .child(kind.label()),
                     )
+                    .child(div().text_xs().text_color(palette.muted).child(page_note(kind)))
                     .child(
                         div()
                             .text_xs()
                             .text_color(palette.muted)
-                            .child(
-                                "仓库的归属在「仓库」页选中项目后点「编辑」设置；这里管的是\
-                                 有哪些分类和标签。改名与删除会同时改到已经归类的仓库上。",
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(palette.muted)
-                            .child(format!("分类 {categories} 个 · 标签 {tags} 个")),
+                            .child(format!("{count} 个")),
                     ),
             )
             .child(
                 v_flex()
                     .flex_1()
                     .min_h_0()
-                    .gap_6()
                     .p_6()
-                    // 滚动方法在 `Stateful<Div>` 上，先给容器一个稳定 id。
-                    .id("taxonomy-scroll")
+                    .id(scroll_id)
                     .overflow_y_scroll()
-                    .child(category_section)
-                    .child(div().h(px(1.)).w_full().bg(palette.border))
-                    .child(tag_section),
+                    .child(body),
             )
     }
 }
 
-/// 改名对话框。名字的预填值是当前的名字，回车即提交。
+/// 页面头部那句说明。两种词表的区别只在归属规则上，说清楚这一点就够了。
+fn page_note(kind: TaxonomyKind) -> &'static str {
+    match kind {
+        TaxonomyKind::Category => {
+            "分类可以分级，用 / 表示层级，如「开发/前端」。一个仓库最多只属于一个分类，\
+             选中上级就等于同时属于它下面所有分类；筛选时也按整棵子树算。归属在「仓库」页\
+             点「编辑」设置，这里管的是有哪些分类。"
+        }
+        TaxonomyKind::Tag => {
+            "一个仓库可以挂任意多个标签。归属在「仓库」页选中项目后点「编辑」设置；\
+             这里管的是有哪些标签。改名与删除会同时改到已经挂上它的仓库上。"
+        }
+    }
+}
+
+/// 改名对话框。名字的预填值是当前的完整路径，回车即提交。
+///
+/// 分类这里改路径就等于移动整棵子树（`开发/前端` → `工具/前端`），所以「挪到别的
+/// 分类底下」不需要另做一个功能。
 fn open_rename_dialog(
     library: Entity<Library>,
     kind: TaxonomyKind,
@@ -406,16 +449,25 @@ fn open_rename_dialog(
             .default_value(old.clone())
             .submit_on_enter(true)
     });
+    let note = if kind.is_hierarchical() {
+        format!("当前路径：{old}。改路径等于连同子分类一起挪动。")
+    } else {
+        "改名之后，已经挂着它的仓库会一起改。".to_string()
+    };
+    // `Theme` 借自 `cx`，要在造 builder 之前抄成值。
+    let muted = cx.theme().muted_foreground;
 
     window.open_dialog(cx, move |dialog, _, _| {
         let library = library.clone();
         let input = input.clone();
         let old = old.clone();
+        let note = note.clone();
 
         dialog
             .title(format!("改{}名", kind.label()))
-            .w(px(420.))
+            .w(px(460.))
             .child(Input::new(&input))
+            .child(div().text_xs().text_color(muted).child(note))
             .footer(
                 DialogFooter::new()
                     .child(
@@ -435,7 +487,6 @@ fn open_rename_dialog(
                 let outcome = library.update(cx, |library, cx| {
                     let outcome = library.rename_name(kind, &old, &raw);
                     if outcome == RenameName::Renamed {
-                        library.persist();
                         cx.notify();
                     }
                     outcome
@@ -462,12 +513,24 @@ fn open_rename_dialog(
                         window.push_notification(Notification::error(invalid_note(kind)), cx);
                         false
                     }
+                    RenameName::Circular => {
+                        window.push_notification(
+                            Notification::error("不能把一个分类挪到它自己的下级里"),
+                            cx,
+                        );
+                        false
+                    }
                     RenameName::NotFound => {
                         window.push_notification(
                             Notification::error(format!("这个词已经不在{}里了", kind.label())),
                             cx,
                         );
                         true
+                    }
+                    RenameName::Failed => {
+                        window.push_notification(Notification::error(write_failed_note()), cx);
+                        // 没写成就别关窗：名字还在框里，用户可以再试一次。
+                        false
                     }
                 }
             })
@@ -486,7 +549,8 @@ fn open_delete_dialog(
     let consequence = match (kind, used_by) {
         (_, 0) => format!("「{name}」还没有任何仓库在用，直接删掉？"),
         (TaxonomyKind::Category, count) => format!(
-            "有 {count} 个仓库属于「{name}」。删掉之后它们会变成未分类，仓库本身不会被移除。"
+            "有 {count} 个仓库属于「{name}」（含它的子分类）。删掉之后它们会变成未分类，\
+             仓库本身不会被移除。"
         ),
         (TaxonomyKind::Tag, count) => format!(
             "有 {count} 个仓库挂着「{name}」。删掉之后这个标签会从它们身上摘掉，仓库本身不会被移除。"
@@ -518,7 +582,6 @@ fn open_delete_dialog(
             .on_ok(move |_, window, cx| {
                 let affected = library.update(cx, |library, cx| {
                     let affected = library.remove_name(kind, &name);
-                    library.persist();
                     cx.notify();
                     affected
                 });
@@ -534,10 +597,118 @@ fn open_delete_dialog(
     });
 }
 
+/// 在某个分类下面新建一个子分类。上级是固定的，所以这里只要末级名字。
+///
+/// 单独做一个对话框而不是复用顶部的输入框：顶部的框要人自己把整条路径打全，
+/// 从树上点下来的路径已经知道上级是谁了，不该再让他补一遍。
+fn open_new_child_dialog(
+    library: Entity<Library>,
+    parent: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("子分类名，回车即建")
+            .submit_on_enter(true)
+    });
+    let note = format!("会建在「{parent}」下面，路径是 {parent}/名字。");
+    let muted = cx.theme().muted_foreground;
+
+    window.open_dialog(cx, move |dialog, _, _| {
+        let library = library.clone();
+        let input = input.clone();
+        let parent = parent.clone();
+        let note = note.clone();
+
+        dialog
+            .title("新建子分类")
+            .w(px(460.))
+            .child(Input::new(&input))
+            .child(div().text_xs().text_color(muted).child(note))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        DialogClose::new().child(
+                            Button::new("cancel-new-child")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("confirm-new-child").label("新建").primary()),
+                    ),
+            )
+            .on_ok(move |_, window, cx| {
+                let leaf = input.read(cx).value().to_string();
+                let path = tax::join_path(&[parent.clone(), leaf.clone()]);
+
+                let outcome = library.update(cx, |library, cx| {
+                    let outcome = library.add_name(TaxonomyKind::Category, &path);
+                    if outcome == AddName::Added {
+                        cx.notify();
+                    }
+                    outcome
+                });
+
+                match outcome {
+                    AddName::Added => {
+                        window.push_notification(
+                            Notification::success(format!("已添加分类「{path}」")),
+                            cx,
+                        );
+                        true
+                    }
+                    AddName::AlreadyPresent => {
+                        window.push_notification(
+                            Notification::warning(format!("「{parent}」下面已经有它了")),
+                            cx,
+                        );
+                        false
+                    }
+                    AddName::Invalid => {
+                        window.push_notification(Notification::error(invalid_note(
+                            TaxonomyKind::Category,
+                        )), cx);
+                        false
+                    }
+                    AddName::Failed => {
+                        window.push_notification(Notification::error(write_failed_note()), cx);
+                        false
+                    }
+                }
+            })
+    });
+}
+
 fn invalid_note(kind: TaxonomyKind) -> String {
-    format!(
-        "{}名不能为空，也不要超过 {} 个字",
-        kind.label(),
-        tax::MAX_NAME_CHARS
-    )
+    if kind.is_hierarchical() {
+        format!(
+            "每一级都不能为空，单级不超过 {} 个字，最多 {} 级",
+            tax::MAX_NAME_CHARS,
+            tax::MAX_DEPTH
+        )
+    } else {
+        format!(
+            "{}名不能为空，也不要超过 {} 个字",
+            kind.label(),
+            tax::MAX_NAME_CHARS
+        )
+    }
+}
+
+/// 写库失败的统一说法。具体原因（磁盘、权限之类）在页面顶部的横幅上，
+/// 这里只负责把人指过去——通知一闪就没，说不清那种细节。
+fn write_failed_note() -> &'static str {
+    "写数据库失败，这次改动没有保存；原因见顶部的提示条"
+}
+
+/// 按词表种类收干净输入。和 `Library` 里的规则同源，这里只为把提示文字说对。
+fn cleaned_for(kind: TaxonomyKind, raw: &str) -> Option<String> {
+    if kind.is_hierarchical() {
+        tax::clean_path(raw)
+    } else {
+        tax::clean_name(raw)
+    }
 }

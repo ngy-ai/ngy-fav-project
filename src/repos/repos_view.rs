@@ -18,15 +18,16 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::discovery::DiscoveryRunner;
-use crate::library::Library;
+use crate::library::{CategoryRow, Library};
 use crate::repos::add_repo_dialog;
 use crate::repos::edit_description_dialog;
-use crate::repos::list_delegate::{CategoryFilter, RepoListDelegate, RepoRow};
+use crate::repos::list_delegate::RepoListDelegate;
+use crate::repos::model::{CategoryFilter, RepoPage};
 use crate::repos::taxonomy_dialog;
 use crate::repos::RepoId;
 use crate::shared::clock::{format_local_date, format_local_minute, format_relative, now_unix};
 use crate::taxonomy::chip;
-use crate::taxonomy::model::TaxonomyKind;
+use crate::taxonomy::model as tax;
 
 /// 列表栏宽度。固定宽度让详情面板有稳定的阅读宽度，也避免拖拽时重新布局。
 const LIST_WIDTH: f32 = 320.;
@@ -77,18 +78,19 @@ impl ReposView {
 
         let mut subscriptions = Vec::new();
 
-        // 后台发现、元数据补全都会改 `Library`，这里是界面跟上它的唯一入口。
+        // 数据变了（后台发现了新仓库、详情里改过分类）就重新查一次当前页。
         subscriptions.push(cx.observe(&library, |this, _, cx| {
-            this.sync_rows(cx);
+            this.sync_page(cx);
         }));
 
-        // 列表是选中项的所有者；视图只镜像它，不再自己维护一份可写副本。
+        // 列表通知过来的两种情况：选中项变了，或者 delegate 里的查询条件变了
+        // （输入搜索词、点翻页）。前者镜像给详情面板，后者得去查一次库。
         subscriptions.push(cx.observe(&list, |this, list, cx| {
             let selection = list.read(cx).delegate().selection().cloned();
             if this.selected != selection {
                 this.selected = selection;
-                cx.notify();
             }
+            this.sync_page(cx);
         }));
 
         // 输入框只在对话框里被渲染，能收到回车就说明对话框正开着。
@@ -110,63 +112,92 @@ impl ReposView {
             selected: None,
             _subscriptions: subscriptions,
         };
-        view.sync_rows(cx);
+        view.sync_page(cx);
         view
     }
 
-    /// 把 `Library` 里的仓库推给列表 delegate。
-    fn sync_rows(&mut self, cx: &mut Context<Self>) {
-        let (rows, categories): (Vec<RepoRow>, Vec<String>) = {
+    /// 拿列表当前的条件去 `Library` 查一页，再塞回列表。
+    ///
+    /// 它是「条件 / 数据 → 界面」这条路上的唯一一步：搜索词、分类筛选、页码都只
+    /// 存在 delegate 里，查询只有这里做一次。查回来的结果跟原来一样时
+    /// `accept_page` 返回 `false`，所以不会出现「通知 → 再查 → 再通知」转不停。
+    fn sync_page(&mut self, cx: &mut Context<Self>) {
+        // 先把要用的东西抄出来——下面还要 `list.update`，不能一直借着 `cx`。
+        let (query, categories) = {
             let library = self.library.read(cx);
-            let rows = library
-                .repos_newest_first()
-                .into_iter()
-                .map(|repo| RepoRow {
-                    id: repo.id(),
-                    full_name: repo.full_name.clone(),
-                    subtitle: repo
-                        .display_description()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "暂无描述，等待补全".to_string()),
-                    language: repo.language.clone(),
-                    pending_metadata: repo.has_pending_metadata(),
-                    category: repo.category.clone(),
-                    tags: repo.tags.clone(),
-                })
-                .collect();
-            (rows, library.names(TaxonomyKind::Category).to_vec())
+            let delegate = self.list.read(cx).delegate();
+            (delegate.query().clone(), library.category_rows())
         };
 
+        // 分类被删掉之后，原来按它筛的列表会永远空着——退回「全部」。
+        let category_gone = match &query.category {
+            CategoryFilter::Named(path) => {
+                !categories.iter().any(|row| tax::same_name(&row.path, path))
+            }
+            _ => false,
+        };
+        let filter = if category_gone {
+            CategoryFilter::All
+        } else {
+            query.category.clone()
+        };
+
+        let mut wanted = query;
+        if category_gone {
+            wanted.category = CategoryFilter::All;
+            wanted.page = 0;
+        }
+
+        let (page, selected_gone) = {
+            let library = self.library.read(cx);
+            (
+                library.query_repos(&wanted),
+                self.selected
+                    .as_ref()
+                    .is_some_and(|id| library.repo(id).is_none()),
+            )
+        };
         // 被移除的仓库不能继续占着选中状态，否则详情面板会指向一个不存在的东西。
-        let selected_still_present = self
-            .selected
-            .as_ref()
-            .is_some_and(|id| rows.iter().any(|row| &row.id == id));
-        if !selected_still_present {
+        // 判据是「还在不在库里」而不是「在不在这一页」——翻了页的选中不该丢。
+        if selected_gone {
             self.selected = None;
         }
         let selected = self.selected.clone();
 
         self.list.update(cx, |state, cx| {
             let delegate = state.delegate_mut();
-            // 分类被删掉之后，原来按它筛的列表会永远空着——退回「全部」。
-            if let CategoryFilter::Named(name) = delegate.category_filter().clone()
-                && !categories.iter().any(|current| current == &name)
-            {
-                delegate.set_category_filter(CategoryFilter::All);
-            }
-            delegate.set_rows(rows);
+            delegate.set_category_filter(filter);
+            let changed = delegate.accept_page(page);
             delegate.set_selected(selected);
-            cx.notify();
+            if changed {
+                cx.notify();
+            }
         });
+        // 页一样也可能有别的东西要跟着变（筛选项上的仓库数），让本视图重绘一次。
         cx.notify();
     }
 
-    /// 切换分类筛选。筛选状态住在 delegate 里——它才是过滤的人，两边各存一份迟早对不上。
-    fn set_category_filter(&self, filter: CategoryFilter, cx: &mut Context<Self>) {
+    /// 切换分类筛选。条件存在 delegate 里，改完通知一声，[`Self::sync_page`]
+    /// 就会去查库。
+    fn set_category_filter(&mut self, filter: CategoryFilter, cx: &mut Context<Self>) {
         self.list.update(cx, |state, cx| {
             state.delegate_mut().set_category_filter(filter);
             cx.notify();
+        });
+    }
+
+    /// 翻一页。已经在头尾时 delegate 不动，也就不会白查一次。
+    fn turn_page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.list.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            let moved = if forward {
+                delegate.go_to_next_page()
+            } else {
+                delegate.go_to_prev_page()
+            };
+            if moved {
+                cx.notify();
+            }
         });
     }
 
@@ -174,7 +205,7 @@ impl ReposView {
         let raw = self.input.read(cx).value().to_string();
         if add_repo_dialog::submit(&self.library, &self.runner, &self.input, &raw, window, cx) {
             // 提交成功后对话框会关闭，这里只需要让列表立刻反映新增项。
-            self.sync_rows(cx);
+            self.sync_page(cx);
         }
     }
 
@@ -192,7 +223,8 @@ impl ReposView {
             discovered_at: repo.discovered_at,
             created_at: repo.created_at,
             source: repo.source.clone(),
-            category: repo.category.clone(),
+            // 分类存的是树上的节点 id，显示要的是路径——从树里现取。
+            category: library.repo_category_path(id),
             tags: repo.tags.clone(),
             pending: repo.has_pending_metadata(),
         })
@@ -225,19 +257,18 @@ impl ReposView {
     /// 分类筛选条。词表为空时整条不画——只有一个「全部」的筛选条纯属占地方。
     ///
     /// 只列有仓库的分类，外加当前正选中的那个：空分类摆一排是噪音，但选中的
-    /// 那个必须留着，否则筛完之后连点回去的地方都没有。
+    /// 那个必须留着，否则筛完之后连点回去的地方都没有。计数是**整棵子树**的
+    /// 数量，跟点下去之后看到的结果条数一致。
+    ///
+    /// 按钮上写完整路径（`开发/前端 3`）而不是靠缩进排成树：筛选条是横着折行的，
+    /// 缩进在这里没有稳定的参照，路径本身反而最短。
     fn render_filter_bar(&self, total: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (categories, uncategorized, filter) = {
             let library = self.library.read(cx);
             let categories: Vec<(String, usize)> = library
-                .names(TaxonomyKind::Category)
-                .iter()
-                .map(|name| {
-                    (
-                        name.clone(),
-                        library.repo_count_using(TaxonomyKind::Category, name),
-                    )
-                })
+                .category_rows()
+                .into_iter()
+                .map(|row: CategoryRow| (row.path, row.repos))
                 .collect();
             let filter = self.list.read(cx).delegate().category_filter().clone();
             (categories, library.uncategorized_count(), filter)
@@ -296,23 +327,27 @@ impl ReposView {
         )
     }
 
-    fn render_list_panel(
-        &self,
-        total: usize,
-        pending: usize,
-        visible: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_list_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let border = theme.border;
         let background = theme.background;
 
+        // 库里的总数，不是当前这一页的条数。
+        let total = self.library.read(cx).repo_count();
         let filter_bar = self.render_filter_bar(total, cx);
-        let count_text = if visible == total {
+        let (pending, page) = {
+            let library = self.library.read(cx);
+            (
+                library.pending_metadata_count(),
+                self.list.read(cx).delegate().page().clone(),
+            )
+        };
+
+        let count_text = if page.total == total {
             format!("{total} 个")
         } else {
-            format!("{total} 个 · 筛出 {visible}")
+            format!("{total} 个 · 筛出 {}", page.total)
         };
         let count_text = match pending {
             0 => count_text,
@@ -376,6 +411,58 @@ impl ReposView {
                     .flex_1()
                     .min_h_0()
                     .child(List::new(&self.list).search_placeholder("搜索名称、描述、语言、分类或标签")),
+            )
+            // 只有一页时不画：一条没用不上的控件只会让人以为还能翻。
+            .when(page.page_count() > 1, |this| this.child(self.render_pager(&page, muted, border, cx)))
+    }
+
+    /// 底部的翻页条：左边说清楚现在看的是哪几条，右边两个按钮。
+    fn render_pager(
+        &self,
+        page: &RepoPage,
+        muted: Hsla,
+        border: Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(border)
+            .child(
+                div().text_xs().text_color(muted).child(format!(
+                    "第 {}/{} 页 · 第 {}-{} 条",
+                    page.page + 1,
+                    page.page_count(),
+                    page.first_index(),
+                    page.last_index()
+                )),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("repo-page-prev")
+                            .icon(IconName::ChevronLeft)
+                            .ghost()
+                            .small()
+                            .tooltip("上一页")
+                            .disabled(!page.has_prev())
+                            .on_click(cx.listener(|this, _, _, cx| this.turn_page(false, cx))),
+                    )
+                    .child(
+                        Button::new("repo-page-next")
+                            .icon(IconName::ChevronRight)
+                            .ghost()
+                            .small()
+                            .tooltip("下一页")
+                            .disabled(!page.has_next())
+                            .on_click(cx.listener(|this, _, _, cx| this.turn_page(true, cx))),
+                    ),
             )
     }
 
@@ -693,10 +780,10 @@ impl ReposView {
                                             )),
                                     )
                                     .on_ok(move |_, window, cx| {
+                                        // 落库由 `Library` 自己做完，这里不必再存一次盘。
                                         let removed = library.update(cx, |library, cx| {
                                             let removed = library.remove_repo(&id);
                                             if removed {
-                                                library.persist();
                                                 cx.notify();
                                             }
                                             removed
@@ -724,22 +811,12 @@ impl ReposView {
 
 impl Render for ReposView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (total, pending, visible) = {
-            let library = self.library.read(cx);
-            let visible = self.list.read(cx).delegate().visible_count();
-            (
-                library.data().repos.len(),
-                library.pending_metadata_count(),
-                visible,
-            )
-        };
-
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
 
         let detail = self.render_detail(cx);
-        let list_panel = self.render_list_panel(total, pending, visible, cx);
+        let list_panel = self.render_list_panel(cx);
 
         h_flex()
             .size_full()

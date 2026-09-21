@@ -31,13 +31,28 @@ pub fn category_colors(name: &str, dark: bool) -> (Hsla, Hsla, Hsla) {
     }
 }
 
-/// 分类色块。
+/// 分类色块，显示完整路径。
+///
+/// 颜色取自**整条路径**而不是末级名字：`开发/前端` 和 `工具/前端` 是两个分类，
+/// 不该长得一模一样。
 pub fn category_tag(name: &str, dark: bool) -> Tag {
     let (background, foreground, border) = category_colors(name, dark);
     Tag::custom(background, foreground, border)
         .small()
         .rounded_full()
         .child(name.to_string())
+}
+
+/// 分类色块，只显示末级名字。
+///
+/// `path` 决定颜色——`开发/前端` 与 `工具/前端` 是两个分类，不该长得一模一样；
+/// `leaf` 决定写什么字。列表行很窄，画不下整条路径。
+pub fn category_leaf_tag(path: &str, leaf: &str, dark: bool) -> Tag {
+    let (background, foreground, border) = category_colors(path, dark);
+    Tag::custom(background, foreground, border)
+        .small()
+        .rounded_full()
+        .child(leaf.to_string())
 }
 
 /// 标签色块。前面带 `#`，一眼能和分类区分开。

@@ -91,7 +91,6 @@ pub fn submit(
         let outcome = library.add_repo(Repo::new(full_name.clone(), None, now_unix()));
         added = outcome == AddOutcome::Added;
         if added {
-            library.persist();
             cx.notify();
         }
         outcome

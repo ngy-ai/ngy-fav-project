@@ -3,9 +3,11 @@
 //! 这里只负责「把页面 / 接口变成结构化的数据」，不碰存储与界面。
 //! 解析函数都是纯函数，可以直接用真实抓下来的 HTML 片段做单测。
 
+pub mod rate_limit;
 pub mod repo_meta;
 pub mod trending;
 
+pub use rate_limit::{RateLimit, RateLimitGate, describe_exhausted};
 pub use repo_meta::{RepoMeta, RepoMetaOutcome, fetch_repo_meta};
 pub use trending::{TrendingEntry, parse_trending};
 
@@ -33,11 +35,12 @@ pub fn describe_http_error(error: &HttpError) -> String {
         HttpError::Status {
             code: code @ (403 | 429),
             url,
+            ..
         } => format!(
             "请求被拒绝（HTTP {code}）。GitHub 未认证接口每小时只有 60 次，\
              稍后重试或在「设置」里填一个访问令牌（{url}）"
         ),
-        HttpError::Status { code, url } => format!("HTTP {code}：{url}"),
+        HttpError::Status { code, url, .. } => format!("HTTP {code}：{url}"),
         other => other.to_string(),
     }
 }

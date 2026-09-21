@@ -13,6 +13,8 @@ scraper = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "3"
+# 存储层。bundled 会把 SQLite 的 C 源码一起编进来，不依赖系统里装没装 sqlite3。
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 # 只为了把 assets/icon.ico 嵌进 exe，非 Windows 平台不需要。
 [target.'cfg(windows)'.build-dependencies]

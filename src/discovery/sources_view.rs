@@ -132,7 +132,6 @@ impl SourcesView {
         let outcome = self.library.update(cx, |library, cx| {
             let outcome = library.add_source(DiscoverySource::new(name.clone(), url.clone()));
             if outcome == AddOutcome::Added {
-                library.persist();
                 cx.notify();
             }
             outcome
@@ -176,9 +175,13 @@ impl SourcesView {
         };
         let last_added = runner.last_added();
         let remaining = runner.rate_limit_remaining();
+        let blocked_until = runner.rate_limit_until();
         let last_error = runner.last_error().map(str::to_string);
         let ran_before = runner.last_finished_at().is_some();
-        let next_run = runner.next_run_at(cx);
+        // 被配额挡住时不显示「下次自动运行」：那个时间到了也不会跑（巡检会
+        // 一直拒绝起新一轮），摆着只会让人等一件不会发生的事。恢复时刻写在
+        // 同一个位置上，语义正好接得上。
+        let next_run = runner.next_run_at(cx).filter(|_| blocked_until.is_none());
 
         v_flex()
             .gap_1()
@@ -196,6 +199,18 @@ impl SourcesView {
                         .child(format!("下次自动运行：{}", format_local_minute(at))),
                 )
             })
+            .when_some(blocked_until, |this, until| {
+                let minutes = (until - now_unix() + 59) / 60;
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.warning)
+                        .child(format!(
+                            "GitHub 接口配额已用完，已停止联网；约 {minutes} 分钟后（{} 起）自动恢复",
+                            format_local_minute(until)
+                        )),
+                )
+            })
             .when(ran_before && last_added > 0, |this| {
                 this.child(
                     div()
@@ -204,14 +219,17 @@ impl SourcesView {
                         .child(format!("上次新增 {last_added} 个仓库")),
                 )
             })
-            .when_some(remaining, |this, remaining| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.muted)
-                        .child(format!("GitHub 接口剩余配额：{remaining} 次/小时")),
-                )
-            })
+            .when_some(
+                remaining.filter(|_| blocked_until.is_none()),
+                |this, remaining| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(palette.muted)
+                            .child(format!("GitHub 接口剩余配额：{remaining} 次/小时")),
+                    )
+                },
+            )
             .when_some(last_error, |this, error| {
                 this.child(
                     div()
@@ -288,7 +306,6 @@ impl SourcesView {
                                         move |checked, _, cx| {
                                             library.update(cx, |library, cx| {
                                                 library.set_source_enabled(&url, *checked);
-                                                library.persist();
                                                 cx.notify();
                                             });
                                         }
@@ -307,7 +324,6 @@ impl SourcesView {
                                         let removed = library.update(cx, |library, cx| {
                                             let removed = library.remove_source(&url);
                                             if removed {
-                                                library.persist();
                                                 cx.notify();
                                             }
                                             removed

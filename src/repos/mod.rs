@@ -8,6 +8,6 @@ mod list_delegate;
 mod repos_view;
 mod taxonomy_dialog;
 
-pub use list_delegate::{CategoryFilter, RepoListDelegate, RepoRow};
-pub use model::{Repo, RepoId, parse_full_name};
+pub use list_delegate::RepoListDelegate;
+pub use model::{CategoryFilter, Repo, RepoId, RepoRow, parse_full_name};
 pub use repos_view::ReposView;

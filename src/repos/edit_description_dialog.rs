@@ -57,7 +57,6 @@ pub fn open(
                 let changed = library.update(cx, |library, cx| {
                     let changed = library.set_description_zh(&id, Some(text));
                     if changed {
-                        library.persist();
                         cx.notify();
                     }
                     changed

@@ -30,17 +30,21 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(assignment) = library.read(cx).repo(&repo_id).map(|repo| RepoAssignment {
-        repo_id: repo_id.clone(),
-        category: repo.category.clone(),
-        tags: repo.tags.clone(),
+    // 仓库上存的是分类节点 id，选框里要比对的是路径——从树上现取一份。
+    let Some(assignment) = ({
+        let library = library.read(cx);
+        library.repo(&repo_id).map(|repo| RepoAssignment {
+            repo_id: repo_id.clone(),
+            category: library.repo_category_path(&repo_id),
+            tags: repo.tags.clone(),
+        })
     }) else {
         return;
     };
 
     let category_input = cx.new(|cx| {
         InputState::new(window, cx)
-            .placeholder("新分类，回车新建并选中")
+            .placeholder("新分类，可用 / 分层，如 开发/前端")
             .submit_on_enter(true)
     });
     let tag_input = cx.new(|cx| {
@@ -210,12 +214,17 @@ impl AssignmentDraft {
     ///
     /// 返回 `None` 表示这个名字不能用。词表里已有同名但写法不同时，返回的是词表
     /// 里的写法——名字的身份忽略大小写，认同一份。
+    ///
+    /// 分类接受 `开发/前端` 这样的路径，缺的上级会一起建上。
     fn store_name(&self, kind: TaxonomyKind, raw: &str, cx: &mut App) -> Option<String> {
-        let cleaned = tax::clean_name(raw)?;
+        let cleaned = if kind.is_hierarchical() {
+            tax::clean_path(raw)?
+        } else {
+            tax::clean_name(raw)?
+        };
 
         self.library.update(cx, |library, cx| {
             if library.add_name(kind, &cleaned) == AddName::Added {
-                library.persist();
                 cx.notify();
             }
         });
@@ -235,7 +244,6 @@ impl AssignmentDraft {
             let tags_ok = library.set_repo_tags(&self.repo_id, &self.tags);
             let ok = category_ok && tags_ok;
             if ok {
-                library.persist();
                 cx.notify();
             }
             ok
@@ -304,7 +312,19 @@ impl AssignmentDraft {
             let theme = cx.theme();
             (theme.muted_foreground, theme.danger)
         };
-        let names: Vec<String> = self.library.read(cx).names(kind).to_vec();
+        let names: Vec<String> = {
+            let library = self.library.read(cx);
+            if kind.is_hierarchical() {
+                // 按树序摆，父在子前面，扫一眼就知道谁在哪一支下面。
+                library
+                    .category_rows()
+                    .into_iter()
+                    .map(|row| row.path)
+                    .collect()
+            } else {
+                library.names(kind).to_vec()
+            }
+        };
         let has_names = !names.is_empty();
 
         let (input, error) = match kind {
@@ -387,7 +407,7 @@ impl Render for AssignmentDraft {
             .gap_4()
             .child(self.render_section(
                 TaxonomyKind::Category,
-                "一个仓库只能属于一个分类",
+                "只能选一个；选中上级就等于也属于它下面的分类",
                 cx,
             ))
             .child(div().h(px(1.)).w_full().bg(border))

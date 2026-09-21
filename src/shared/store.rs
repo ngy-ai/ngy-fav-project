@@ -1,8 +1,17 @@
-//! 数据文件的存放位置与原子写入。
+//! 数据放在哪里。
+//!
+//! 数据只有一份，在一个 SQLite 库里（见 [`default_db_path`]）。这里只管位置，
+//! 读写本身归 `db` 模块——落盘的一次性保障（事务、WAL）由 SQLite 给，不再自己
+//! 写临时文件再改名。
+//!
+//! 唯一还需要动文件的地方是[留档](archive_file)：迁移过的旧 `library.json` 不能
+//! 悄悄删掉，改名留一份，用户哪天想找回什么还有地方看。
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::shared::clock::now_unix;
 
 /// 应用目录名，同时用于数据目录与配置目录。
 const APP_DIR: &str = "ngy-fav-project";
@@ -42,63 +51,52 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(".").join(APP_DIR)
 }
 
-/// 仓库库数据文件。
-pub fn default_library_path() -> PathBuf {
-    data_dir().join("library.json")
+/// 数据库文件。仓库、分类树、标签、发现源与设置都在里面。
+pub fn default_db_path() -> PathBuf {
+    data_dir().join("library.db")
 }
 
-/// 读取文本；文件不存在返回 `Ok(None)`，其余 IO 错误原样上报。
-pub fn read_text(path: &Path) -> io::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// 先写临时文件再 `rename`，避免进程在写一半时被终止留下半个 JSON。
-pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, contents)?;
-
-    // Windows 的 rename 不能覆盖已存在的文件。
-    if let Err(error) = fs::rename(&temp, path) {
-        if path.exists() {
-            fs::remove_file(path)?;
-            fs::rename(&temp, path)?;
-        } else {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
-        }
-    }
-    Ok(())
+/// 把一个文件改名留档，名字里带上时间戳。
+///
+/// 用于迁移过的旧数据文件：新库已经接手了，但旧文件是用户的数据，删掉就没有了，
+/// 留一份改过名的在旁边最稳妥。
+pub fn archive_file(path: &Path, tag: &str) -> io::Result<PathBuf> {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "backup".to_string());
+    let archived = path.with_file_name(format!("{stem}.{tag}-{}.json", now_unix()));
+    fs::rename(path, &archived)?;
+    Ok(archived)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::prelude::v1::test;
 
     #[test]
-    fn atomic_write_replaces_existing_content() {
-        let dir = std::env::temp_dir().join("ngy-fav-store-test");
+    fn archiving_renames_instead_of_deleting() {
+        let dir = std::env::temp_dir().join(format!("ngy-fav-store-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
         let path = dir.join("library.json");
+        fs::write(&path, "{\"repos\":[]}").unwrap();
 
-        write_atomic(&path, "{\"a\":1}").expect("首次写入");
-        assert_eq!(read_text(&path).unwrap().unwrap(), "{\"a\":1}");
-
-        write_atomic(&path, "{\"a\":2}").expect("覆盖写入");
-        assert_eq!(read_text(&path).unwrap().unwrap(), "{\"a\":2}");
+        let archived = archive_file(&path, "legacy").expect("改名留档");
+        assert!(!path.exists(), "原名让出来了");
+        assert!(archived.exists(), "内容还在，只是换了个名字");
+        assert!(
+            archived.file_name().unwrap().to_string_lossy().contains("legacy"),
+            "名字里带上留档的原因：{archived:?}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn missing_file_is_not_an_error() {
-        let path = std::env::temp_dir().join("ngy-fav-does-not-exist/library.json");
-        assert!(read_text(&path).unwrap().is_none());
+    fn the_database_lives_beside_the_rest_of_the_data() {
+        let path = default_db_path();
+        assert_eq!(path.file_name().unwrap(), "library.db");
+        assert_eq!(path.parent(), Some(data_dir().as_path()));
     }
 }

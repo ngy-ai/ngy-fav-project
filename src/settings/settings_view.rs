@@ -118,7 +118,6 @@ impl SettingsView {
             let mut settings = library.settings().clone();
             f(&mut settings);
             library.update_settings(settings);
-            library.persist();
             cx.notify();
         });
     }
@@ -219,7 +218,7 @@ impl Render for SettingsView {
                 settings.effective_interval_minutes(),
                 settings.metadata_batch,
                 settings.token().is_some(),
-                library.data().repos.len(),
+                library.repo_count(),
                 library.sources().len(),
                 library.path().display().to_string(),
                 library.save_state().clone(),
@@ -256,7 +255,6 @@ impl Render for SettingsView {
                                         let mut settings = library.settings().clone();
                                         settings.auto_discover = *checked;
                                         library.update_settings(settings);
-                                        library.persist();
                                         cx.notify();
                                     });
                                 })
@@ -339,7 +337,7 @@ impl Render for SettingsView {
                 .gap_2()
                 .child(heading(
                     "GitHub 访问令牌",
-                    "可选。填了之后接口配额从 60 次/小时提到 5000；令牌只存在本地数据文件里。",
+                    "可选。填了之后接口配额从 60 次/小时提到 5000；令牌只存在本地数据库里。",
                     muted,
                 ))
                 .child(
@@ -391,7 +389,7 @@ impl Render for SettingsView {
                                 .text_xs()
                                 .text_color(muted)
                                 .truncate()
-                                .child(format!("数据文件：{path}")),
+                                .child(format!("数据库：{path}")),
                         ),
                 ),
         );

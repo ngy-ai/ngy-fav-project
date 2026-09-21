@@ -1,4 +1,4 @@
-//! 应用外壳：左侧导航 + 三个功能页 + 窗口级覆盖层。
+//! 应用外壳：左侧导航 + 五个功能页 + 窗口级覆盖层。
 //!
 //! 一个窗口只有一个 `Root`（在 `main` 里包住本视图），而对话框、通知这些
 //! 覆盖层的内容由应用自己渲染——`Root` 只负责调度，不会替你画出来。
@@ -20,14 +20,15 @@ use crate::discovery::SourcesView;
 use crate::library::{Library, SaveState};
 use crate::repos::ReposView;
 use crate::settings::SettingsView;
-use crate::taxonomy::TaxonomyView;
+use crate::taxonomy::{TaxonomyKind, TaxonomyView};
 
 const SIDEBAR_WIDTH: f32 = 208.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Repos,
-    Taxonomy,
+    Categories,
+    Tags,
     Discovery,
     Settings,
 }
@@ -36,7 +37,8 @@ impl Page {
     fn title(&self) -> &'static str {
         match self {
             Self::Repos => "仓库",
-            Self::Taxonomy => "分类与标签",
+            Self::Categories => "分类",
+            Self::Tags => "标签",
             Self::Discovery => "发现",
             Self::Settings => "设置",
         }
@@ -47,7 +49,9 @@ pub struct AppShell {
     library: Entity<Library>,
     runner: Entity<DiscoveryRunner>,
     repos: Entity<ReposView>,
-    taxonomy: Entity<TaxonomyView>,
+    /// 分类页与标签页是同一个视图的两份实例，各自管一个词表。
+    categories: Entity<TaxonomyView>,
+    tags: Entity<TaxonomyView>,
     sources: Entity<SourcesView>,
     settings: Entity<SettingsView>,
     page: Page,
@@ -63,7 +67,9 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Self {
         let repos = cx.new(|cx| ReposView::new(library.clone(), runner.clone(), window, cx));
-        let taxonomy = cx.new(|cx| TaxonomyView::new(library.clone(), window, cx));
+        let categories =
+            cx.new(|cx| TaxonomyView::new(library.clone(), TaxonomyKind::Category, window, cx));
+        let tags = cx.new(|cx| TaxonomyView::new(library.clone(), TaxonomyKind::Tag, window, cx));
         let sources = cx.new(|cx| SourcesView::new(library.clone(), runner.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::new(library.clone(), window, cx));
         let subscriptions = vec![
@@ -75,7 +81,8 @@ impl AppShell {
             library,
             runner,
             repos,
-            taxonomy,
+            categories,
+            tags,
             sources,
             settings,
             page: Page::Repos,
@@ -163,8 +170,10 @@ impl AppShell {
                 SidebarMenu::new().children([
                     item(Page::Repos, IconName::Library, self.page)
                         .on_click(cx.listener(|this, _, _, cx| this.go(Page::Repos, cx))),
-                    item(Page::Taxonomy, IconName::Tags, self.page)
-                        .on_click(cx.listener(|this, _, _, cx| this.go(Page::Taxonomy, cx))),
+                    item(Page::Categories, IconName::FolderTree, self.page)
+                        .on_click(cx.listener(|this, _, _, cx| this.go(Page::Categories, cx))),
+                    item(Page::Tags, IconName::Tag, self.page)
+                        .on_click(cx.listener(|this, _, _, cx| this.go(Page::Tags, cx))),
                     item(Page::Discovery, IconName::Radar, self.page)
                         .on_click(cx.listener(|this, _, _, cx| this.go(Page::Discovery, cx))),
                     item(Page::Settings, IconName::Settings, self.page)
@@ -229,24 +238,35 @@ impl Render for AppShell {
         let foreground = theme.foreground;
         let border = theme.border;
 
-        let (load_warning, save_error) = {
+        let (load_warning, load_note, save_error) = {
             let library = self.library.read(cx);
             let save_error = match library.save_state() {
                 SaveState::Failed(error) => Some(error.clone()),
                 _ => None,
             };
-            (library.load_warning().map(str::to_string), save_error)
+            (
+                library.load_warning().map(str::to_string),
+                library.load_note().map(str::to_string),
+                save_error,
+            )
         };
 
         let status = self.status_text(cx);
         let sidebar = self.render_sidebar(&status, cx);
         let top_bar = self.render_top_bar(&status, cx);
 
-        // 读取或写盘出问题必须一直摆在脸上，不能只在通知里闪一下。
+        // 读取或写库出问题必须一直摆在脸上，不能只在通知里闪一下。迁移这类
+        // 「一次性好消息」也走横幅：它只在真的搬迁过的那一次启动里出现。
         let banners: Vec<AnyElement> = [
             load_warning.map(|warning| {
                 Alert::warning("library-load-warning", warning)
-                    .title("数据文件读取异常")
+                    .title("数据库读取异常")
+                    .banner()
+                    .into_any_element()
+            }),
+            load_note.map(|note| {
+                Alert::info("library-load-note", note)
+                    .title("数据已迁移")
                     .banner()
                     .into_any_element()
             }),
@@ -263,7 +283,8 @@ impl Render for AppShell {
 
         let content: AnyElement = match self.page {
             Page::Repos => self.repos.clone().into_any_element(),
-            Page::Taxonomy => self.taxonomy.clone().into_any_element(),
+            Page::Categories => self.categories.clone().into_any_element(),
+            Page::Tags => self.tags.clone().into_any_element(),
             Page::Discovery => self.sources.clone().into_any_element(),
             Page::Settings => self.settings.clone().into_any_element(),
         };
