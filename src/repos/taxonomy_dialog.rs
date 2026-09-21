@@ -18,10 +18,14 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::library::Library;
+use crate::library::{CategoryRow, Library};
 use crate::repos::RepoId;
 use crate::shared::text::copyable_as;
 use crate::taxonomy::model::{self as tax, AddName, TaxonomyKind};
+use crate::taxonomy::picker::{self, PickerRow};
+
+/// 分类下拉里那个「不分类」固定项的 key。它不是一个分类，所以不能和路径撞名。
+const NONE_CATEGORY: &str = "none";
 
 /// 打开编辑框。当前归属从 `Library` 现读，仓库已经不在了就直接不开。
 pub fn open(
@@ -251,35 +255,8 @@ impl AssignmentDraft {
         })
     }
 
-    fn is_category(&self, name: &str) -> bool {
-        self.category
-            .as_deref()
-            .is_some_and(|current| tax::same_name(current, name))
-    }
-
     fn has_tag(&self, name: &str) -> bool {
         self.tags.iter().any(|tag| tax::same_name(tag, name))
-    }
-
-    /// 分类的单选项。`None` 是「不分类」——分类是单选，总得留一条退回去的路。
-    fn category_choice(&self, value: Option<String>, cx: &mut Context<Self>) -> AnyElement {
-        let (label, active) = match &value {
-            Some(name) => (name.clone(), self.is_category(name)),
-            None => ("不分类".to_string(), self.category.is_none()),
-        };
-        let id: ElementId = match &value {
-            Some(name) => format!("pick-category:{name}").into(),
-            None => "pick-category:none".into(),
-        };
-
-        let mut button = Button::new(id).label(label).small();
-        button = if active { button.primary() } else { button.outline() };
-        button
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.category = value.clone();
-                cx.notify();
-            }))
-            .into_any_element()
     }
 
     /// 标签的多选项，再点一次摘掉。
@@ -313,17 +290,16 @@ impl AssignmentDraft {
             let theme = cx.theme();
             (theme.muted_foreground, theme.danger)
         };
-        let names: Vec<String> = {
+        // 分类那份要留着给下拉树用（它需要叶子名与层数），标签只要名字。
+        let (categories, names): (Vec<CategoryRow>, Vec<String>) = {
             let library = self.library.read(cx);
             if kind.is_hierarchical() {
                 // 按树序摆，父在子前面，扫一眼就知道谁在哪一支下面。
-                library
-                    .category_rows()
-                    .into_iter()
-                    .map(|row| row.path)
-                    .collect()
+                let categories = library.category_rows();
+                let names = categories.iter().map(|row| row.path.clone()).collect();
+                (categories, names)
             } else {
-                library.names(kind).to_vec()
+                (Vec::new(), library.names(kind).to_vec())
             }
         };
         let has_names = !names.is_empty();
@@ -333,17 +309,50 @@ impl AssignmentDraft {
             TaxonomyKind::Tag => (&self.tag_input, self.tag_error.clone()),
         };
 
-        // 分类是单选，所以先摆一个「不分类」；标签没有这个概念。
-        let mut chips: Vec<AnyElement> = Vec::new();
-        if kind == TaxonomyKind::Category {
-            chips.push(self.category_choice(None, cx));
-        }
-        for name in names {
-            chips.push(match kind {
-                TaxonomyKind::Category => self.category_choice(Some(name), cx),
-                TaxonomyKind::Tag => self.tag_choice(name, cx),
-            });
-        }
+        // 分类是单选，所以下拉树里最前面摆一个「不分类」；标签没有这个概念。
+        let chooser: AnyElement = match kind {
+            TaxonomyKind::Category => {
+                let mut rows = vec![PickerRow::fixed(NONE_CATEGORY, "不分类", None)];
+                rows.extend(picker::category_rows(categories, false));
+                let selected = self
+                    .category
+                    .clone()
+                    .unwrap_or_else(|| NONE_CATEGORY.to_string());
+                let draft = cx.entity();
+                picker::Picker::new(
+                    "assign-category",
+                    IconName::FolderTree,
+                    self.category
+                        .clone()
+                        .unwrap_or_else(|| "不分类".to_string()),
+                )
+                .rows(rows)
+                .selected(vec![selected])
+                // 铺满整个对话框：它是个输入控件，不是排在行里的一颗按钮。
+                .stretch()
+                .on_pick(move |key, _window, cx| {
+                    // 交出来的是分类路径，唯一要翻译的是那个固定项。
+                    let value = (key != NONE_CATEGORY).then_some(key);
+                    draft.update(cx, |this, cx| {
+                        this.category = value;
+                        cx.notify();
+                    });
+                })
+                .into_element()
+            }
+            TaxonomyKind::Tag => {
+                let chips: Vec<AnyElement> = names
+                    .iter()
+                    .cloned()
+                    .map(|name| self.tag_choice(name, cx))
+                    .collect();
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(chips)
+                    .into_any_element()
+            }
+        };
 
         let create = match kind {
             TaxonomyKind::Category => Button::new("create-category")
@@ -379,18 +388,15 @@ impl AssignmentDraft {
                     ),
             )
             .child(
-                h_flex()
-                    .flex_wrap()
+                v_flex()
                     .gap_1()
+                    .child(chooser)
                     .when(!has_names, |this| {
-                        this.child(
-                            div().text_xs().text_color(muted).child(copyable_as(
-                                format!("assign-empty:{}", kind.label()),
-                                format!("还没有{}，在下面新建", kind.label()),
-                            )),
-                        )
-                    })
-                    .children(chips),
+                        this.child(div().text_xs().text_color(muted).child(copyable_as(
+                            format!("assign-empty:{}", kind.label()),
+                            format!("还没有{}，在下面新建", kind.label()),
+                        )))
+                    }),
             )
             .child(
                 h_flex()
@@ -426,4 +432,95 @@ impl Render for AssignmentDraft {
 
 fn invalid_name_note() -> String {
     format!("名字不能为空，也不要超过 {} 个字", tax::MAX_NAME_CHARS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 一个在临时目录里、带一个仓库和一条分类的库。
+    fn seeded_library() -> Library {
+        // 同一毫秒里可能建好几个库，光靠时间戳会撞。
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "ngy-fav-taxonomy-dialog-{}-{stamp}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let mut library = Library::load_from(dir.join("library.db"));
+        library.add_repo(crate::repos::model::Repo::new("a/rust".to_string(), None, 1));
+        library.add_name(TaxonomyKind::Category, "开发/前端");
+        library
+    }
+
+    /// 分类选框是一个下拉树，它长在「分类与标签」对话框的正文里。这条测试渲染的
+    /// 就是那段正文（`AssignmentDraft`）：点开按钮、点一行、菜单收起，最后看这一下
+    /// 有没有真的落到草稿上——保存时被写进库里的正是草稿。
+    ///
+    /// **没有连对话框外壳一起测**：`window.open_dialog` 的正文排在 `Root` 的
+    /// deferred 层里，无头窗口按 id 找不到里面的元素（对话框确实开了，但元素不在
+    /// 可观测的元素树里）。外壳是组件库的事，这条要盯的是正文里那次选择。
+    #[gpui_kit::test]
+    fn picking_a_category_lands_on_the_draft(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let library = cx.new(|_| seeded_library());
+        let (draft, cx) = cx.add_window_view(move |window, cx: &mut Context<AssignmentDraft>| {
+            let category_input = cx.new(|cx| InputState::new(window, cx));
+            let tag_input = cx.new(|cx| InputState::new(window, cx));
+            AssignmentDraft::new(
+                library,
+                RepoAssignment {
+                    repo_id: "a/rust".to_string(),
+                    category: None,
+                    tags: Vec::new(),
+                },
+                category_input,
+                tag_input,
+                window,
+                cx,
+            )
+        });
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("assign-category-slot").is_some(),
+                "分类得是一个下拉框，不再是一排色块"
+            );
+            assert!(
+                window.try_find("assign-category-menu").is_none(),
+                "没点之前是收着的"
+            );
+
+            window.click("assign-category-slot", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("assign-category-menu").is_some(),
+                "点一下要展开分类树"
+            );
+
+            window.click("assign-category-row:开发/前端", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("assign-category-menu").is_none(),
+                "选完要自己收起来"
+            );
+            assert_eq!(
+                draft.read(cx).category.as_deref(),
+                Some("开发/前端"),
+                "选中的分类要落到草稿上，保存时写的就是它"
+            );
+        });
+    }
 }

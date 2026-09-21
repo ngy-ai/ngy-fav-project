@@ -28,6 +28,7 @@ use gpui_kit::*;
 use crate::repos::model::{CategoryFilter, DEFAULT_PAGE_SIZE, RepoId, RepoPage, RepoQuery, RepoRow};
 use crate::shared::text::{copyable, copyable_as};
 use crate::taxonomy::chip;
+use crate::taxonomy::model as tax;
 
 pub struct RepoListDelegate {
     /// 当前想要的查询条件。翻页就是改它里面的 `page`。
@@ -123,6 +124,81 @@ impl RepoListDelegate {
         self.query.page = 0;
     }
 
+    /// 当前选的语言。`None` 是「不限语言」。
+    pub fn language_filter(&self) -> Option<&str> {
+        self.query.language.as_deref()
+    }
+
+    /// 换一种语言；`None` 退回「不限语言」。同样回到第一页。
+    pub fn set_language(&mut self, language: Option<String>) {
+        if self.query.language == language {
+            return;
+        }
+        self.query.language = language;
+        self.query.page = 0;
+    }
+
+    /// 当前选中的标签。
+    pub fn tags_filter(&self) -> &[String] {
+        &self.query.tags
+    }
+
+    /// 整体替换标签选择。落进来的东西会先收干净：去空白、忽略大小写去重，
+    /// 再按 [`name_key`](crate::taxonomy::model::name_key) 排序。
+    ///
+    /// **顺序不跟着点击走**是有意的：「先点 A 再点 B」和「先点 B 再点 A」是同一
+    /// 组选择，必须写出同一份条件——否则「条件没变就不重查」这类比较会失效，
+    /// 顺带把 SQL 里的参数顺序也弄成看运气的。
+    pub fn set_tags(&mut self, tags: Vec<String>) {
+        let mut cleaned: Vec<String> = Vec::with_capacity(tags.len());
+        for tag in tags {
+            let tag = tag.trim();
+            if tag.is_empty() || cleaned.iter().any(|it| tax::same_name(it, tag)) {
+                continue;
+            }
+            cleaned.push(tag.to_string());
+        }
+        cleaned.sort_by_key(|name| tax::name_key(name));
+
+        if self.query.tags == cleaned {
+            return;
+        }
+        self.query.tags = cleaned;
+        self.query.page = 0;
+    }
+
+    /// 点一下某个标签：挂着就摘掉，没挂就挂上。
+    pub fn toggle_tag(&mut self, name: &str) {
+        let mut tags = self.query.tags.clone();
+        match tags.iter().position(|it| tax::same_name(it, name)) {
+            Some(position) => {
+                tags.remove(position);
+            }
+            None => tags.push(name.to_string()),
+        }
+        self.set_tags(tags);
+    }
+
+    /// 清掉三个下拉上的筛选。**不动搜索词**：搜索框里显示什么由它自己的状态管，
+    /// 从这里抹掉只会让框里的字和实际条件对不上。
+    pub fn clear_filters(&mut self) {
+        let had = self.has_facet_filters();
+        self.query.category = CategoryFilter::All;
+        self.query.language = None;
+        self.query.tags.clear();
+        if had {
+            self.query.page = 0;
+        }
+    }
+
+    /// 三个下拉上有条件没有——「清除筛选」按钮显不显示就看它。
+    /// 按钮清的东西和这个判断必须是同一件事，所以放在一起。
+    pub fn has_facet_filters(&self) -> bool {
+        self.query.category != CategoryFilter::All
+            || self.query.language.is_some()
+            || !self.query.tags.is_empty()
+    }
+
     /// 请求某一页。越界由 `Library` 那边回退，这里不做二次判断。
     pub fn request_page(&mut self, page: usize) {
         self.query.page = page;
@@ -157,9 +233,7 @@ impl RepoListDelegate {
     /// 整个列表是不是空的（跟当前筛选无关），用于区分「一个仓库都没有」和
     /// 「筛完什么都不剩」。
     pub fn is_really_empty(&self) -> bool {
-        self.page.total == 0
-            && self.query.search.trim().is_empty()
-            && self.query.category == CategoryFilter::All
+        self.page.total == 0 && !self.query.has_filters()
     }
 
     pub fn row_at(&self, ix: IndexPath) -> Option<&RepoRow> {
@@ -379,8 +453,92 @@ mod tests {
     }
 
     #[test]
-    fn accept_page_says_whether_anything_changed() {
+    fn picking_a_language_goes_back_to_the_first_page() {
         let mut delegate = RepoListDelegate::new();
+        delegate.accept_page(page(200, 3, &["a/one"]));
+
+        delegate.set_language(Some("Rust".to_string()));
+        assert_eq!(delegate.query().page, 0);
+        assert_eq!(delegate.language_filter(), Some("Rust"));
+
+        // 再点同一个不该把页码重置掉——那会把用户翻到的位置抹了。
+        delegate.accept_page(page(200, 2, &["a/one"]));
+        delegate.set_language(Some("Rust".to_string()));
+        assert_eq!(delegate.query().page, 2);
+
+        delegate.set_language(None);
+        assert_eq!(delegate.language_filter(), None, "「不限语言」要把条件清掉");
+    }
+
+    #[test]
+    fn a_tag_is_toggled_on_and_off() {
+        let mut delegate = RepoListDelegate::new();
+        delegate.accept_page(page(200, 3, &["a/one"]));
+
+        delegate.toggle_tag("cli");
+        assert_eq!(delegate.tags_filter(), ["cli"]);
+        assert_eq!(delegate.query().page, 0, "加了筛选就回第一页");
+
+        delegate.toggle_tag("待读");
+        assert_eq!(delegate.tags_filter(), ["cli", "待读"]);
+
+        // 大小写不同也是同一个标签，再点一次要摘掉。
+        delegate.toggle_tag("CLI");
+        assert_eq!(delegate.tags_filter(), ["待读"]);
+
+        delegate.toggle_tag("待读");
+        assert!(delegate.tags_filter().is_empty());
+    }
+
+    #[test]
+    fn the_tag_order_follows_the_name_not_the_click_order() {
+        // 同一组选择必须写出同一份条件，否则「条件没变就不重查」的比较会失效，
+        // 库里那条 SQL 的参数顺序也变成看运气。
+        let mut one = RepoListDelegate::new();
+        one.toggle_tag("cli");
+        one.toggle_tag("待读");
+
+        let mut other = RepoListDelegate::new();
+        other.toggle_tag("待读");
+        other.toggle_tag("cli");
+
+        assert_eq!(one.tags_filter(), other.tags_filter());
+        assert_eq!(one.query(), other.query());
+    }
+
+    #[test]
+    fn clearing_puts_every_dropdown_back_but_leaves_the_search_word() {
+        let mut delegate = RepoListDelegate::new();
+        delegate.set_search("rust");
+        delegate.set_category_filter(CategoryFilter::Named("工具".into()));
+        delegate.set_language(Some("Rust".to_string()));
+        delegate.toggle_tag("cli");
+        assert!(delegate.has_facet_filters());
+
+        delegate.clear_filters();
+        // 搜索框里的字由它自己的状态管，从这里抹掉只会让框里显示的和实际条件对不上。
+        assert_eq!(delegate.query().search, "rust", "搜索词不归「清除」管");
+        assert_eq!(delegate.category_filter(), &CategoryFilter::All);
+        assert_eq!(delegate.language_filter(), None);
+        assert!(delegate.tags_filter().is_empty());
+        assert!(!delegate.has_facet_filters());
+    }
+
+    #[test]
+    fn a_language_or_tag_filter_is_not_an_empty_library() {
+        let mut delegate = RepoListDelegate::new();
+        delegate.set_language(Some("Rust".to_string()));
+        delegate.accept_page(page(0, 0, &[]));
+        assert!(!delegate.is_really_empty(), "有语言条件，只是没筛出东西");
+
+        let mut delegate = RepoListDelegate::new();
+        delegate.toggle_tag("cli");
+        delegate.accept_page(page(0, 0, &[]));
+        assert!(!delegate.is_really_empty(), "有标签条件，只是没筛出东西");
+    }
+
+    #[test]
+    fn accept_page_says_whether_anything_changed() {        let mut delegate = RepoListDelegate::new();
 
         assert!(
             delegate.accept_page(page(2, 0, &["a/one", "b/two"])),

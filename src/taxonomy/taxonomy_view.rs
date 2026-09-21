@@ -6,7 +6,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     input::{Input, InputEvent, InputState},
@@ -17,7 +17,7 @@ use gpui_kit::*;
 
 use crate::library::Library;
 use crate::taxonomy::chip;
-use crate::taxonomy::model::{self as tax, AddName, RenameName, TaxonomyKind};
+use crate::taxonomy::model::{self as tax, AddName, MoveName, RenameName, TaxonomyKind};
 
 /// 页面要用到的主题色。`Theme` 借自 `cx`，用之前先抄成值，
 /// 免得后面还要 `&mut cx` 时和它撞上。
@@ -57,6 +57,11 @@ struct NameRow {
     depth: usize,
     /// 直接子分类数量；标签恒为 0。
     children: usize,
+    /// 同级里它前面还有没有兄弟。没有就把「上移」灰掉——按下不会有任何反应，
+    /// 不如直接说明没有余地。
+    has_prev: bool,
+    /// 同级里它后面还有没有兄弟。
+    has_next: bool,
 }
 
 pub struct TaxonomyView {
@@ -140,7 +145,7 @@ impl TaxonomyView {
     /// 标签是扁平的，本身就已经是显示顺序。
     fn rows(&self, cx: &Context<Self>) -> Vec<NameRow> {
         let library = self.library.read(cx);
-        if self.kind.is_hierarchical() {
+        let mut rows: Vec<NameRow> = if self.kind.is_hierarchical() {
             library
                 .category_rows()
                 .into_iter()
@@ -150,6 +155,8 @@ impl TaxonomyView {
                     used_by: row.repos,
                     depth: row.depth,
                     children: row.children,
+                    has_prev: false,
+                    has_next: false,
                 })
                 .collect()
         } else {
@@ -162,9 +169,13 @@ impl TaxonomyView {
                     used_by: library.repo_count_using(TaxonomyKind::Tag, &tag.name),
                     depth: 1,
                     children: 0,
+                    has_prev: false,
+                    has_next: false,
                 })
                 .collect()
-        }
+        };
+        mark_siblings(self.kind, &mut rows);
+        rows
     }
 
     fn render_body(&self, palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -293,6 +304,40 @@ impl TaxonomyView {
                 h_flex()
                     .gap_1()
                     .flex_shrink_0()
+                    // 前后挪一格。位置只影响这一页怎么摆，跟仓库归属无关，
+                    // 所以是个随手就能按的小按钮，不像改名那样还要填对话框。
+                    .child(anchored(
+                        move_id(kind, true, &row.name),
+                        Button::new(format!("{}-button", move_id(kind, true, &row.name)))
+                            .icon(IconName::ArrowUp)
+                            .ghost()
+                            .small()
+                            .tooltip("在同级里往前挪一格")
+                            .disabled(!row.has_prev)
+                            .on_click({
+                                let library = self.library.clone();
+                                let name = name.clone();
+                                move |_, window, cx| {
+                                    move_name(&library, kind, name.clone(), -1, window, cx);
+                                }
+                            }),
+                    ))
+                    .child(anchored(
+                        move_id(kind, false, &row.name),
+                        Button::new(format!("{}-button", move_id(kind, false, &row.name)))
+                            .icon(IconName::ArrowDown)
+                            .ghost()
+                            .small()
+                            .tooltip("在同级里往后挪一格")
+                            .disabled(!row.has_next)
+                            .on_click({
+                                let library = self.library.clone();
+                                let name = name.clone();
+                                move |_, window, cx| {
+                                    move_name(&library, kind, name.clone(), 1, window, cx);
+                                }
+                            }),
+                    ))
                     .when(row.children > 0, |this| {
                         this.child(
                             div()
@@ -424,6 +469,94 @@ impl Render for TaxonomyView {
                     .child(body),
             )
     }
+}
+
+/// 上移/下移按钮的元素 id。带名字不带下标：下标会随着增删错位，
+/// 而「按下去要动的那一项」永远是按名字找出来的那一个。
+fn move_id(kind: TaxonomyKind, up: bool, name: &str) -> ElementId {
+    let what = match (kind, up) {
+        (TaxonomyKind::Category, true) => "move-up-category",
+        (TaxonomyKind::Category, false) => "move-down-category",
+        (TaxonomyKind::Tag, true) => "move-up-tag",
+        (TaxonomyKind::Tag, false) => "move-down-tag",
+    };
+    format!("{what}:{name}").into()
+}
+
+/// 给按钮套一层带身份的外壳。
+///
+/// 只为测试能按 id 点到它：`Button` 这种一次性渲染的组件挂不上 `test_support`，
+/// 而外壳是个 `div`，能挂。真实点击照样落在里面的按钮上。
+fn anchored(id: ElementId, button: impl IntoElement) -> AnyElement {
+    div().id(id).test_support().child(button).into_any_element()
+}
+
+/// 标记每一行在同级里还有没有前后邻居，那两个按钮据此决定亮不亮。
+///
+/// 分类不能只看相邻两行：`开发 / 开发/前端 / 开发/后端` 里「后端」上面那一行是
+/// 「前端」的子分类，不是它的兄弟。树序铺平之后，**往上遇到的第一个不比它深的行**
+/// 才是它上一个兄弟——更深的是别人家的后代，更浅的是它的上级。
+fn mark_siblings(kind: TaxonomyKind, rows: &mut [NameRow]) {
+    if !kind.is_hierarchical() {
+        // 标签是平的，同级就是全部。
+        let last = rows.len().saturating_sub(1);
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.has_prev = index > 0;
+            row.has_next = index < last;
+        }
+        return;
+    }
+
+    // 先整批算出来再写回：算的时候要读整个 `rows`，边算边写会和借用打起来。
+    let flags: Vec<(bool, bool)> = (0..rows.len())
+        .map(|index| {
+            let depth = rows[index].depth;
+            let above = rows[..index]
+                .iter()
+                .rev()
+                .find(|row| row.depth <= depth)
+                .is_some_and(|row| row.depth == depth);
+            let below = rows[index + 1..]
+                .iter()
+                .find(|row| row.depth <= depth)
+                .is_some_and(|row| row.depth == depth);
+            (above, below)
+        })
+        .collect();
+    for (row, (has_prev, has_next)) in rows.iter_mut().zip(flags) {
+        row.has_prev = has_prev;
+        row.has_next = has_next;
+    }
+}
+
+/// 挪一格，再把结果说给用户听。
+fn move_name(
+    library: &Entity<Library>,
+    kind: TaxonomyKind,
+    name: String,
+    delta: i64,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let outcome = library.update(cx, |library, cx| {
+        let outcome = library.move_name(kind, &name, delta);
+        if outcome == MoveName::Moved {
+            cx.notify();
+        }
+        outcome
+    });
+
+    let note = match outcome {
+        // 位置变了，这一页上直接看得见，不用再弹一句。
+        MoveName::Moved => return,
+        MoveName::AtEdge => Notification::warning(format!(
+            "「{name}」已经在{}了",
+            if delta < 0 { "最前面" } else { "最后面" }
+        )),
+        MoveName::NotFound => Notification::warning(format!("「{name}」已经不在词表里了")),
+        MoveName::Failed => Notification::error(write_failed_note()),
+    };
+    window.push_notification(note, cx);
 }
 
 /// 页面头部那句说明。两种词表的区别只在归属规则上，说清楚这一点就够了。
@@ -718,5 +851,200 @@ fn cleaned_for(kind: TaxonomyKind, raw: &str) -> Option<String> {
         tax::clean_path(raw)
     } else {
         tax::clean_name(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `gpui_kit::*` 会把 GPUI 的 `#[gpui::test]` 带进来盖掉 std 的 `#[test]`。
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt as _;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// 每次都给一个新的临时目录：固定目录名会让第二次跑读到上一次留下的顺序，
+    /// 断言就开始飘。
+    fn seeded_library(name: &str) -> Library {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "ngy-fav-taxonomy-view-{name}-{}-{stamp}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let mut library = Library::load_from(dir.join("library.db"));
+        for category in ["工具", "工具/前端", "学习", "学习/书"] {
+            library.add_name(TaxonomyKind::Category, category);
+        }
+        for tag in ["cli", "待读"] {
+            library.add_name(TaxonomyKind::Tag, tag);
+        }
+        library
+    }
+
+    /// 窗口的根必须是一个自己实现了 `Render` 的类型（`Entity<T>` 不算），而被测的
+    /// 视图要拿到窗口才建得出来。所以套一层壳：壳在窗口里建视图，句柄另存一份。
+    struct Shell {
+        view: Entity<TaxonomyView>,
+    }
+
+    impl Render for Shell {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.view.clone()
+        }
+    }
+
+    /// 这一层只有跑起来才说得清：按钮有没有连上、灰掉的那两个是不是真的按不动、
+    /// 按完之后顺序有没有真的落到库里。
+    #[gpui_kit::test]
+    fn the_move_buttons_reorder_the_tree(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let library = cx.new(|_| seeded_library("move-buttons"));
+        let slot: Rc<RefCell<Option<Entity<TaxonomyView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            let library = library.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx
+                    .new(|cx| TaxonomyView::new(library, TaxonomyKind::Category, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Shell { view }
+            })
+        };
+
+        let names = |cx: &mut TestAppContext| {
+            let view = slot.borrow().clone().expect("窗口已经建好");
+            cx.update(|app| {
+                view.read(app)
+                    .library
+                    .read(app)
+                    .names(TaxonomyKind::Category)
+            })
+        };
+
+        assert_eq!(
+            names(cx),
+            ["工具", "工具/前端", "学习", "学习/书"],
+            "一开始是建起来的顺序"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // 已经在最前面的那一项，按钮是灰的：按下去什么都不会发生。
+            window.click("move-up-category:工具", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(
+            names(cx),
+            ["工具", "工具/前端", "学习", "学习/书"],
+            "按下灰按钮不该动任何东西"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("move-down-category:工具", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(
+            names(cx),
+            ["学习", "学习/书", "工具", "工具/前端"],
+            "工具换到学习后面，它的子分类跟着一起走"
+        );
+
+        // 子分类只在同级里换：`工具/前端` 是独苗，两个方向都没有余地。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("move-up-category:工具/前端", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(names(cx), ["学习", "学习/书", "工具", "工具/前端"]);
+    }
+
+    /// 标签页是同一份视图的另一个实例，同一套按钮照样管用；顺手确认它挪的是
+    /// 自己那张词表，没有把手伸到分类上去。
+    #[gpui_kit::test]
+    fn the_tags_page_moves_its_own_list(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let library = cx.new(|_| seeded_library("move-tags"));
+        let slot: Rc<RefCell<Option<Entity<TaxonomyView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            let library = library.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| TaxonomyView::new(library, TaxonomyKind::Tag, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Shell { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("move-down-tag:cli", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let (tags, categories) = {
+            let view = slot.borrow().clone().expect("窗口已经建好");
+            cx.update(|app| {
+                let library = view.read(app).library.read(app);
+                (
+                    library.names(TaxonomyKind::Tag),
+                    library.names(TaxonomyKind::Category),
+                )
+            })
+        };
+        assert_eq!(tags, ["待读", "cli"]);
+        assert_eq!(
+            categories,
+            ["工具", "工具/前端", "学习", "学习/书"],
+            "标签页的按钮不该动到分类"
+        );
+    }
+
+    /// 「上一个兄弟」不是上一行：`开发 / 开发/前端 / 开发/后端` 里「开发/后端」
+    /// 上面那一行是「前端」的子分类。这条纯函数就是那两个按钮亮不亮的依据。
+    #[test]
+    fn siblings_are_found_by_depth_not_by_the_line_above() {
+        let row = |name: &str, depth: usize| NameRow {
+            name: name.to_string(),
+            leaf: name.to_string(),
+            used_by: 0,
+            depth,
+            children: 0,
+            has_prev: false,
+            has_next: false,
+        };
+        let mut rows = vec![
+            row("开发", 1),
+            row("开发/前端", 2),
+            row("开发/前端/框架", 3),
+            row("开发/后端", 2),
+            row("学习", 1),
+        ];
+        mark_siblings(TaxonomyKind::Category, &mut rows);
+
+        let flags: Vec<(bool, bool)> = rows.iter().map(|row| (row.has_prev, row.has_next)).collect();
+        assert_eq!(
+            flags,
+            [
+                (false, true),  // 开发：后面是学习
+                (false, true),  // 前端：前面没有，后面是后端
+                (false, false), // 框架：独苗
+                (true, false),  // 后端：前面是前端（不是上面那行的框架）
+                (true, false),  // 学习：前面是开发
+            ]
+        );
     }
 }

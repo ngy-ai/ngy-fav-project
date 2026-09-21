@@ -81,6 +81,21 @@ pub enum RenameName {
     Failed,
 }
 
+/// 挪动词表里某一项前后顺序的结果。
+///
+/// 顺序只是界面上的摆放：分类的父子关系记在 `parent_id` 上，仓库的分类记在节点 id 上，
+/// 都跟 `position` 无关——所以挪位置不会动到任何归属。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveName {
+    Moved,
+    /// 已经在同级的两头，没有再往前/往后的余地，什么都没改。
+    AtEdge,
+    /// 要挪的那个名字不在词表里。
+    NotFound,
+    /// 写库失败，这次改动整个丢了。
+    Failed,
+}
+
 /// 收干净用户输入的名字。返回 `None` 表示这个名字不能用。
 ///
 /// 首尾空白去掉、内部连续空白压成一个空格——`"AI  工具"` 与 `" AI 工具 "`

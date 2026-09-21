@@ -1,224 +1,117 @@
 # ngy-fav-project — 项目长期约定
 
 GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说明见根目录 `README.md`，
-这里只记改代码时必须守住的约定，以及 README 里不写的坑。
+这里只记改代码时必须守住的约定和 README 不写的坑；细一点的配方在末节那些技能里。
 
-## 分层约定
+## 分层
 
-- **`src/library.rs` 是领域数据的唯一持有者**，SQLite 是权威、内存是镜像。
-  视图不缓存仓库副本，只观察 `Entity<Library>`；列表按页从库里取。
-- **先写库，成功了再改内存**。所有修改走 `Library::write(|db| ...)`，失败记进
-  `save_state`（界面顶部横幅报错）。反过来做会留下「只在内存里、下次启动就没」的假象。
-  唯一的例外是分类树：写成功后 `reload_categories()` 整批重读（表小，增量容易漏）。
-- **时间只从 `src/shared/clock.rs` 出**，全项目一律 `i64` Unix 秒。不要直接调 `SystemTime`。
-- **`src/shared/net.rs` 是唯一的 HTTP 出口**。它把 `ureq` 的阻塞调用放到独立 OS 线程再桥回 async，
-  所以不占 GPUI 共享后台线程池。新增网络请求走它，别直接 `ureq`。
-- **`net.rs` 的 agent 关掉了 ureq 的 `http_status_as_error`**（默认是开的）。开着的话 4xx/5xx
-  会在 `ureq` 内部变成 `Err(StatusCode)`，**响应头连同正文全丢**——撞配额时那个 403 上的
-  `X-RateLimit-Remaining` / `X-RateLimit-Reset` 正是唯一能判断「是不是配额、几时恢复」的依据。
-  所以非 2xx 也走 `Ok(response)`，由 `blocking_get` 统一读头读正文，再自己转成
-  `HttpError::Status { code, url, rate_limit_remaining, rate_limit_reset, body }`。
-  **重定向不受影响**（`run.rs` 里按 `status().is_redirection()` 单独处理，与这个开关无关）。
-- **解析与网络分离**。`github/trending.rs`、`github/repo_meta.rs` 的解析都是纯函数
-  （字符串进、结构体出），测试用真实抓下来的 HTML 片段，不联网。
-- **解析出 0 条要返回 `Err`**，不能返回空 `Vec`——空列表会被上层误读成「本轮无新项目」。
-- **`RunPlan` 是配置快照**。一轮开始时把配置读成值，抓取途中用户改设置不影响本轮。
-- **`shared/store.rs` 只管「数据放哪」**。读写归 `src/db/`（SQLite 给事务与 WAL），
-  它现在只剩目录解析与 `archive_file`（旧文件改名留档）。**不要再往那里加写文件的函数。**
+- **`src/library.rs` 是领域数据的唯一持有者**。SQLite 是权威、内存是镜像；视图不缓存仓库，
+  只观察 `Entity<Library>`。
+- **先写库，成功了再改内存**，一律走 `Library::write(|db| ...)`，失败记进 `save_state`
+  （界面顶部横幅）。唯一例外是分类树：写成功后 `reload_categories()` 整批重读。
+- **时间只从 `shared/clock.rs` 出**（全项目 `i64` Unix 秒）。**`shared/net.rs` 是唯一 HTTP 出口**
+  （ureq 的阻塞调用放独立 OS 线程再桥回 async）。它关掉了 ureq 的 `http_status_as_error`：开着的话
+  4xx/5xx 变 `Err`，**响应头连同正文全丢**——而撞配额时只有 403 上的 `X-RateLimit-*` 能判断
+  「是不是配额、几时恢复」。**解析出 0 条要返回 `Err`**，空 `Vec` 会被上层读成「本轮无新项目」。
+  **`RunPlan` 是配置快照**：一轮开始时读成值，途中改设置不影响本轮。
+- **`shared/store.rs` 只管「数据放哪」**，读写归 `src/db/`。
 
 ## 存储（`src/db/`）
 
-- **读表的函数收 `&Connection` 而不是 `&Db`**，入口是 `Db::open` / `open_in_memory`；
-  事务用 `Db::transaction`（内部 `unchecked_transaction`，因为连接是 `&self`）。
-- **`PRAGMA foreign_keys = ON` 必须在连接上执行**，否则分类树的级联删除完全失效。
-- **`SELECT_COLUMNS` 与 `read_row` 的列下标必须一起改**；`ORDER_BY` 引用了 `r.` 别名，
-  用它的查询语句必须 `FROM repos r`（漏别名 → 运行期 `no such column`）。
-- **`name_key` 列存 Rust 侧小写化的名字**（sqlite 的 `lower()` 只认 ASCII），比较走它。
-- **`PRAGMA user_version` 是 schema 版本**，比程序新就 `SchemaTooNew` 硬失败、不写入。
-- **`read()` 会把错误吞成 `None`**，所以写错 SQL 会表现为「功能静默失灵」而不是报错。
-  加查询时先在测试里跑一遍真实 SQL。
-- 旧 `library.json` **只在全新空库时导入一次**，成功后 `archive_file` 改名留档。
-  库里有数据就完全不碰它。
-
-## 数据位置与搬迁（`shared/store.rs` / `relocate.rs` / `db/merge.rs`）
-
-- **位置分两层，这是数据能搬走的前提**：`store::config_dir()`（固定不动，
-  `%APPDATA%\ngy-fav-project`，里面只有几字节的 `location.json`）与**数据目录**
-  （默认就是配置目录本身）。`store::data_dir()` 现在要读 `location.json`——
-  它已经不是原来那个「数据目录」了，加代码前先看清用的是哪一个。
-- **`location.json` 同时存 `data_dir` 与 `pending_move: {from, strategy}`**。
-  搬家的顺序固定：**先记意图 → 再动文件 → 最后改路径**。`Library::load` 一进来先
-  看有没有 `pending_move`，有就补做完再打开库；补不动就退回老位置、把标记留着下次再试。
-- **`Library::relocate` 是搬数据的唯一入口**（先写 location → 按策略处理目标位置
-  → 关连接 → 搬文件 → `open_at` 新位置 → 清 `pending_move`）。中间任何一步失败都
-  `roll_back` 回原位置，绝不留下「指向空目录」的配置。
-- **`MoveStrategy` 只有三种**（`UseNewOnly` / `Overwrite` / `Merge`），都是「两边都不会
-  同时弄丢」的方案。界面上按 `ALL` 的顺序摆，附带 `label()` / `hint()`。
-- **合并时新位置是主人**：仓库按 `full_name`（小写后）判重、同名保留新位置那份；
-  分类**按路径**合并（两个库的自增 id 之间没关系）；标签按名字忽略大小写；发现源按 URL；
-  **设置不动**。实现是「源库读成 Rust 值 → 目标库开事务逐条 `INSERT OR IGNORE`」，
-  因为 `ATTACH` 不能跨连接共享而本程序是单连接模型。
-- **用另一个库覆盖目标之前必须 `store::discard_sidecars(target)`**：留着别人的
-  `-wal` / `-shm`，下次打开会拿配不上的 WAL 恢复，那是真会毁数据的。
-- **`store::data_files` 只认 `library.` 开头**且只含字母数字与 `.` `-` `_` 的名字。
-  别放宽成 `library` 开头，`library2.db` 会被误搬。
-- 合并/覆盖的判断要在 `self.db = None` **之前**做——合并读的就是 `self.db`。
+- 读表收 `&Connection`（入口 `Db::open` / `open_in_memory`），事务用 `Db::transaction`
+  （内部 `unchecked_transaction`，因为连接是 `&self`）。
+- **`PRAGMA foreign_keys = ON` 必须在连接上执行**，否则分类的级联删除完全失效。
+- **`SELECT_COLUMNS` 与 `read_row` 的列下标必须一起改**；`ORDER_BY` 引用 `r.` 别名，用它的语句
+  必须 `FROM repos r`（漏了是运行期 `no such column`）。**`name_key` 列存 Rust 侧小写化的名字**
+  （sqlite 的 `lower()` 只认 ASCII）。**`PRAGMA user_version` 是 schema 版本**，比程序新就硬失败、不写入。
+- **`read()` 把错误吞成 `None`**，写错 SQL 表现为「功能静默失灵」而不是报错；加查询先跑真实 SQL。
 
 ## 分类与标签（`src/taxonomy/`）
 
-- **分类是 `parent_id` 真树**（`CategoryTree`），仓库上是 `Repo.category_id: Option<i64>`；
-  **标签**是扁平的 `Repo.tags: Vec<String>`，词表里带稳定 `id`。归属上是单向的：
-  一个仓库最多一个分类，可以挂多个标签。
-- **名字即身份**：比较忽略大小写（`taxonomy::model::same_name`），存第一次出现的写法。
-  名字与路径语法（`clean_name/same_name/clean_path/segments/join_path/hue_seed/name_key`）
-  都在 `taxonomy/model.rs`，是纯函数，先加测试再改。
-- **词表操作只有三个入口**：`Library::{add_name, rename_name, remove_name}`。
-  别在视图里直接改 `data.categories`（那个结构已经不存在了）。
-- **`set_repo_category` / `set_repo_tags` 拒绝词表外的名字**（返回 `false` 且什么都不改）。
-  界面上的「新建」是「先 `add_name` 再挂上」，所以正常路径碰不到拒绝。
-- **`name_key` 比较在 SQL 里做**：同级唯一是 `UNIQUE(ifnull(parent_id,0), name_key)`。
-- **列表行的分类色块挂第一行**。`List` 要求所有行等高，行数不能随内容变（见 list_delegate 注释）。
+- **分类是 `parent_id` 真树**（仓库上是 `Repo.category_id: Option<i64>`）；**标签**扁平
+  （`Repo.tags: Vec<String>`，且标签表有自己的 id）。
+- **名字即身份**：比较忽略大小写（`model::same_name`），存第一次出现的写法。名字与路径语法
+  （`model.rs`）和树操作（`tree.rs`）都是纯函数，**先加测试再改**。
+- **词表只有四个入口**：`Library::{add_name, rename_name, remove_name, move_name}`。别在视图里
+  直接改词表；`set_repo_category` / `set_repo_tags` 拒绝词表外的名字（返回 `false` 且什么都不改）。
+- **名字里的 `/` 只是输入语法**（逐级解析成节点，缺的上级顺手建，最多 6 级）——**父子全靠
+  `parent_id`，别从名字推断**。
+- **同级按 `position` 排**（不按名字码点）。`move_name(kind, name, ±1)` 换的是**同级**的邻居；
+  写库时把整段同级的 `position` 重写成 `0..n`——老数据里可能有并列值，只交换两条会被 id 序盖回去，
+  看着像「点了没反应」。**改名 = 改名 + 移动**（填完整路径，改到自己下级 → `Circular`），
+  所以别另做「移动分类」功能。**删分类连子树一起删**，仓库 `category_id` 置空
+  （外键 `ON DELETE SET NULL`）。
+- **两个管理页**（`Page::Categories` / `Page::Tags`）是同一个 `TaxonomyView` 的两份实例，构造时传
+  `TaxonomyKind`；别按 kind 存两份状态。**列表行的分类色块挂第一行**（`List` 要求所有行等高）。
 
-### 树的规矩
+### 选东西用的下拉（`taxonomy/picker.rs`）
 
-- **分类名里可以带 `/`，但那只是输入语法**。界面上填 `开发/前端`，落到库里是一条
-  逐级解析出来的路径（缺的上级顺手建），分隔符 `/`，最多 6 级。**别再从名字里推断父子关系**。
-- **父子的关系全是 `parent_id`**，纯函数在 `taxonomy/tree.rs`：`segments / path / depth /
-  subtree / is_within / find_path / sibling_named / flatten / insert / set_name / set_parent /
-  remove_subtree`。`CategoryTree::nodes` 恒按 `(position, id)` 排好，所以 `children()` 天生有序。
-- **同级按 `position`（建立顺序）排，不按名字码点**。新建接在末尾，改名不换位置
-  （`rename_category` 只在 `parent != current_parent` 时才调 `move_category`）。
-- **改名 = 改名 + 移动**：改名框填完整路径，`开发/前端` → `工具/前端` 就是挪子树；
-  改成自己的下级 → `RenameName::Circular`。所以别另做「移动分类」功能。
-- **删除分类连子树一起删**，仓库的 `category_id` 被置空（外键 `ON DELETE SET NULL`）。
-  `CategoryRow.repos` / `child_count` 都按子树算。
-- **`name_key` 索引 + 外键是唯一的完整性保障**，界面上的判断都只是提前拦一下。
-- **两个管理页**：`Page::Categories` / `Page::Tags` 是同一个 `TaxonomyView` 的两份实例，
-  构造时传 `TaxonomyKind`。视图里不要再按 kind 存两份输入框。
+- **一个 builder：`Picker::new(prefix, icon, label).rows(..).selected(..).accent(..).stretch()
+  .on_pick(..).into_element()`**。四处在用：筛选条的分类/语言/标签、改仓库分类的选框。这层只做
+  两件事——把行摆出来（`PickerRow`）、点一行之后把 **key** 交出去；**key 是什么意思由调用方解释**，
+  别把 `CategoryFilter` 或仓库带进来。
+- **`PickerRow.close` 决定点完收不收**（`keeping_open()` 造多选的行），picker 层没有「多选模式」
+  这个概念。`selected: Vec<String>`，单选就是 0/1 个。
+- **元素 id 由 prefix 生成**：`{prefix}-slot` / `{prefix}-menu` / `{prefix}-row:{key}`。现用 prefix：
+  `repo-category-filter` / `repo-language-filter` / `repo-tag-filter` / `assign-category`。
+- **Popover 的 trigger 必须实现 `Selectable`**，而它只在 `Button`/`Checkbox`/`Input` 等具体类型上
+  实现（`div()` 不算）→ trigger 由 picker 自己造成 `Button`，外面再包一层带 `test_support` 的 `div`
+  当锚点。同一套办法用在行内的上移/下移按钮上（`Button` 挂不上 `test_support`）。
+- 子分类**只写自己那一段名字**，层级交给缩进；空分类留在树里（缺节点的树看着像坏了）；
+  计数是**整棵子树**的条数。
 
 ## 列表与分页（`src/repos/`）
 
-- **查询的形状在 `repos/model.rs`**：`RepoQuery`（界面要什么）/ `RepoQuerySpec`（拼进 SQL 的条件）/
-  `RepoPage`（一页 + total + 页码）。分页是 `LIMIT/OFFSET` + 单独 `COUNT(*)`。
-- **翻页要有稳定全序**：`ORDER BY r.discovered_at DESC, r.full_name ASC`。少了后半段，
-  同一条记录可能出现在两页里。
-- **页码越界会回退**（`Library::query_repos` 里重查最后一页），别在视图里另做一套钳制。
-- **`CategoryScope::Subtrees(vec![])` 编译成 `WHERE 0`**：筛选一个已不存在的分类宁可空着，
-  也不要静默退回「全部」。
-- **`list_delegate.rs` 不碰数据库，是纯状态**（`query` + 一页 `page` + 选中项），
-  查库是视图的事（`ReposView::sync_page`）。**`accept_page` 返回「变没变」，变了才
-  `cx.notify()`**——无条件通知会让「通知 → 观察者再查一次 → 再通知」转不停。
-  把规则放这儿是为了能用普通 `#[test]` 测（没有 GPUI 上下文）。
+- 形状在 `repos/model.rs`：`RepoQuery` / `RepoQuerySpec` / `RepoPage`，分页是 `LIMIT/OFFSET` +
+  单独 `COUNT(*)`。
+- **翻页要有稳定全序**：`ORDER BY r.discovered_at DESC, r.full_name ASC`（少了后半段，同一条记录
+  可能出现在两页里）。页码越界会回退（`Library::query_repos`），别在视图里再钳一次。
+  **`CategoryScope::Subtrees(vec![])` 编译成 `WHERE 0`**。
+- **筛选有三个维度**：分类（单选，选上级=整棵子树）、语言（`Option<String>`）、标签
+  （`Vec<String>`，**多选、都要有**）；维度之间是**且**。SQL 在 `db/repos.rs::build_filter`：
+  语言 `r.language = ?` **精确相等**（用 `LIKE` 会把 `Gosu` 当 `Go` 捞出来），标签**每个一个 `EXISTS`**。
+- **筛选条上的计数一律全库口径**（`Library::{category_rows, language_rows, tag_rows}` 从内存镜像
+  数出来），不是「在当前条件下还剩几条」；语言按数量降序、标签按词表顺序。
+- **标签选择集合按 `name_key` 排序存**（`delegate.set_tags`）。否则「先点 A 后点 B」与反过来是
+  两份不相等的条件，「条件没变就不重查」失效，SQL 参数顺序也成了看运气。
+- **失效的筛选项在查库之前摘掉**（`ReposView::sync_page`：分类被删、语言不再存在、标签被摘），
+  并回第一页。`delegate.has_facet_filters()` 和「清除」按钮管的必须是同一件事（它不动搜索词）。
+- **`list_delegate.rs` 是纯状态**（不碰数据库）；**`accept_page` 返回「变没变」，变了才
+  `cx.notify()`**——无条件通知会转不停。
 
-## GPUI 界面上的两个固定套路
+## GPUI 界面与测试
 
-- **对话框的状态必须自己是个实体**。`window.open_dialog` 的 builder 是 `Fn`，每帧都会被
-  调用——在里面 `cx.new` 会每帧重建状态。现有做法：`open()` 里先 `cx.new` 出草稿实体
-  （`repos/taxonomy_dialog.rs::AssignmentDraft` 最完整），builder 里只 clone 句柄。
-- **借用**：`entity.read(cx).method(cx)` 编译不过（E0502）。要写盘/改状态就走
-  `entity.update(cx, |this, cx| this.commit(cx))`。
-  另外 `cx.theme()` 借的是 `&cx`，要在造回调之前把颜色抄成值（`Hsla` 是 Copy）。
+- **对话框的状态必须自己是个实体**：`open_dialog` 的 builder 是 `Fn`、每帧都调用，在里面 `cx.new`
+  会每帧重建。做法是 `open()` 里先 `cx.new` 出草稿实体，builder 里只 clone 句柄。
+- **借用**：`entity.read(cx).method(cx)` 编译不过（E0502），改状态走 `entity.update(cx, ...)`；
+  `cx.theme()` 借的是 `&cx`，造回调前把颜色抄成值（`Hsla` 是 Copy）。**弹层里的回调拿不到本视图的
+  `Context`**（popover 的 `content` 给的是 `Context<PopoverState>`），「改状态 + 收起弹层」要靠两个
+  实体句柄。
+- **外观方法来自 trait，必须显式导入**：`ButtonVariants as _`（`.outline()`/`.ghost()`/`.tooltip()`，
+  漏了是 E0599）、`Disableable as _`（`.disabled()`）、`Sizable as _`、`TestWindowExt as _`
+  （无头窗口的 `click` / `render_frame`）。遇到 E0599 先看能编译的文件怎么导入的。
+- **要按 id 找的元素必须挂 `.test_support()`**（不开特性时是恒等函数）；`Button` 这类 `RenderOnce`
+  组件挂不上，要包一层 `div`。**`open_dialog` 的正文排在 `Root` 的 deferred 层里，无头窗口按 id
+  找不到**（`has_active_dialog` 为真但元素不可观测）——要测就把那段正文实体直接当窗口根。
+  **窗口根必须自己实现 `Render`**（`Entity<T>` 不算），`cx.update_window` 给的是 `AnyView`。
+- 测试模块固定写 `use core::prelude::v1::test;` 恢复 std 的 `#[test]`（`gpui_kit::*` 会把
+  `#[gpui::test]` 带进来盖掉它）。
 
-## 文本可选中（`src/shared/text.rs`）
+## 验证与构建
 
-- 选中与剪贴板是 **gpui-base 的窗口级能力**（`SelectableText` + `Root::render` 里那层
-  `TextSelectionLayer`），不要自己写。项目只在 `text.rs` 里包了 `copyable`（id 取代码位置）
-  与 `copyable_as`（显式 id）两个入口。
-- **`SelectableText` 不实现 `Styled`**：`.text_color()` / `.text_sm()` / `.truncate()` 一律没有，
-  样式靠外层 `div` 继承（它的 `request_layout` 用 `window.text_style()`）。写法是
-  `div().text_xs().text_color(muted).child(copyable(...))`。
-- **循环、列表行、同一视图的多份实例必须用 `copyable_as`**。`ListItem::new(id)` 内部只是
-  `h_flex().id(id)`，**不往元素 id 栈里压**，所以同一 `render_item` 里多处 `copyable` 的
-  全局 id 完全一样，第 2 行起会共用第 1 行的选中状态。id 里带上业务主键
-  （`repo-category:{id}` / `source-url:{url}` / `assign-note:{kind.label()}`）。
-- **按钮标签、页面标题不做**：`SelectableText` 会插一层 hitbox，摆在按钮里会把点击抢走。
-  判断标准是「这句话是内容，还是控件本身」。
+- **沙箱里的 cargo 可能卡在文件锁上**，别干等（`Blocking waiting for file lock` + rustc 的 CPU
+  增量恒为 0 = 等锁，不是慢）；清掉抢锁的进程后改用宿主 PowerShell 跑。**跑完一定要杀进程**，
+  残留进程占着 exe，下次 `cargo build` 报 LNK1104，而 `tasklist` 都看不见它。
+- 造临时数据用 `NGY_FAV_HOME` 指到临时目录；核对库里写了什么，用 python 的 `sqlite3` **只读**
+  （`mode=ro`）打开看表。
+- **`cargo fmt` 不要跑**：项目本来就不是 rustfmt 干净的，新代码手工对齐周围风格。
+- **同一条消息里只改一个文件一次**：对同一文件并发发多个 `Edit` 会有改动被吞掉（都报 success，
+  磁盘上只剩一部分），改完 `grep` 复核。
+- 图标由 `tools/make_icon.py` 生成，`build.rs` 自扫 `Windows Kits\10\bin` 找 rc.exe
+  （别退回 winresource 的默认探测，它调 `reg.exe`，而 reg.exe 在本机黑名单里）。
 
-## 后台调度（`src/discovery/runner.rs`）
+## 相关技能
 
-- 巡检每 5 秒一次，判断交给纯函数 `decide(TickState, now)`，触发条件有测试兜着。
-- **两种触发不能合并**：`DueKind::Full`（抓发现源）与 `DueKind::Metadata`（只补元数据）。
-  合并过一次，后果是每 60 秒重抓 trending 并覆盖成功记录。
-- **匿名 API 60 次/小时是硬约束**。任何新的定期请求都要有退避，否则会把配额烧光。
-- 源码改动后要 `cargo clippy --all-targets` 无警告 + `cargo test` 全绿。
-
-### 配额用完就整轮停（`src/github/rate_limit.rs`）
-
-- **判据是三条，不是「看 403」**：`remaining == Some(0)` / 状态码 429 /
-  403 **且正文提到 `rate limit`**（二级限流不带配额头）。光看 403 会把「令牌没权限、
-  仓库被下架」也判成配额用完，那些等多久都不会好。
-- **闸门 `RateLimitGate` 内部是 `Rc<Cell<Option<i64>>>`**，clone 共享状态——`run_plan`
-  里 clone 进各 future 的那份改了，`runner` 持有的那份也跟着变。只在 GPUI 单线程执行器里
-  访问，不要换成原子量或锁。
-- **撞上的那一刻要 `trip`，不是只在轮内 `break`**。只 break 的话下一轮巡检（5 秒后）
-  又会起一轮、又打一遍。`decide` 开头就先看 `rate_limit_until`，没恢复就返回 `None`。
-- **轮内请求在发出去之前要问一次闸门**（metadata 那批在做，且闸门一旦拉下，
-  还没启动的 future 就停在那儿）。已经在飞的拦不回来，上界是 `METADATA_CONCURRENCY`。
-- **`blocked_until` 会 clamp 到 1 小时**，并滤掉过期的 `reset`——中间设备改写响应头
-  或时钟偏差都不该把发现功能永久锁死。
-- **`trip` 合并时先滤掉过期的旧值再取 max**，否则一个已过期的远期值会「接住」新的一次拉闸。
-- **配额掐断的轮不算「无进展」**，不要叠到 `metadata_stall_rounds` 退避上——否则恢复
-  时刻到了还要再多等一轮。
-- **`run_now` / `refresh_metadata_now` 会先 `clear()` 闸门**：用户主动点时多半刚填了令牌
-  （配额 60 → 5000）。真没恢复，第一个请求 403 会立刻再拉上，代价一个请求。
-- 界面侧：`rate_limit_until()` 有值时**不要**再显示「下次自动运行」——那个时间到了也不会跑。
-  两个值占同一行位置。闸门开合那一刻靠 `sync_rate_limit_flag()` 补一次 `notify`，
-  否则恢复时刻到了但没活干时，界面会一直挂着那句过期的「已停止联网」。
-
-## 验证
-
-- **界面截不到图**（`Screenshot` 只看得到宿主桌面，画布不在上面）。但 windows-mcp 的
-  `Process` 能列出沙箱里这个应用进程、`App`（按窗口标题 switch/resize）也认得到窗口，
-  所以「进程起没起来、有没有 panic、数据文件有没有被改写」都能查。
-- **沙箱里的 cargo 可能卡在文件锁上**，别干等：输出 `Blocking waiting for file lock on
-  package cache`、rustc 起来后 CPU 增量恒为 0（10 秒 +0.0s）、20 分钟不出结果——那是等锁，
-  不是慢（宿主上 rustc 编个最小程序只要 0.5 秒）。本机有别的 cargo 在反复抢锁
-  （IDE 的测试运行器会起 `cargo test --lib --locked <name>:: --no-fail-fast`）。
-  用 `Get-CimInstance Win32_Process -Filter "Name='cargo.exe'"` 看是谁，清掉卡住的进程后
-  **改用宿主 PowerShell 跑 `cargo build/test`**：干净环境下增量 3.5 秒，全套几分钟。
-  另外后台任务的 `/tmp` 与当前 shell 的 `/tmp` 可能不同，日志写到 `target/` 里才读得到。
-- **`Button` 的外观方法（`ghost`/`primary`/`danger`…）来自 `ButtonVariants` trait**，
-  每个文件都要 `button::{Button, ButtonVariants as _}`。漏了就是 E0599 `no method named`。
-  遇到这种错，先看**能编译的文件**里同一个方法是怎么导入的。
-- 造临时数据用 `NGY_FAV_HOME` 指到临时目录，别碰 `%APPDATA%` 里的真实数据。
-- 后台跑 GUI 应用要用 `run_in_background`，普通 `&` 会随 shell 退出被杀。
-- **跑完一定要杀进程**（windows-mcp `Process` mode=kill）。残留进程占着
-  `target\debug\ngy-fav-project.exe`，下次 `cargo build` 报 LNK1104「无法打开文件」，
-  而 `tasklist` / `Get-Process` 都看不见它。
-- 想核对库里到底写了什么，用 python 的 `sqlite3` **只读**打开（`mode=ro`）看
-  `categories` / `repos` / `repo_tags`，比在界面上翻快得多。
-- **要判断本机 IP 的匿名配额是不是真的用完了**，直接用 python 打一次
-  `https://api.github.com/repos/<owner>/<repo>`（带上项目的 UA），打印状态码与
-  `x-ratelimit-remaining` / `x-ratelimit-reset`。比猜快，而且能区分「程序坏了」
-  与「配额真的没了」——本机是共享出口 IP，很容易就是后者。
-- **HTTP 层的行为（尤其「非 2xx 还带不带头」）用本机 stub 服务测**，别 mock 传输层：
-  要验证的正是传输层交出了什么。`shared/net.rs` 的 `spawn_stub` 是个只回一次固定响应的
-  `TcpListener`，用 `Connection: close` 结束正文，省得手算 `Content-Length`。
-- `cargo fmt` 不要跑：项目本来就不是 rustfmt 干净的（100 多处 diff，多是既有文件）。
-  新代码手工对齐周围风格即可。
-- **同一条消息里只改一个文件一次。** 对同一个文件并发发多个 `Edit`，会有改动被吞掉
-  （每次都报 success，磁盘上只留下一部分）。改完用 `grep` 复核对不对，别只信成功回执。
-
-## 图标与构建
-
-- `assets/icon.ico` 由 `tools/make_icon.py` 生成（需要 Pillow，装在
-  `C:\Users\admin\.workbuddy\binaries\python\envs\default`）。改图标 = 改脚本再跑一次。
-- `build.rs` 负责嵌入。**别退回 winresource 的默认探测**——它调 `reg.exe` 查注册表，
-  而 reg.exe 在本机安全策略黑名单里。现有实现自己扫 `Windows Kits\10\bin` 找 rc.exe。
-- **`rerun-if-changed` 必须指向 `assets` 目录而非 `assets/icon.ico`**：
-  监视当时不存在的文件会把「缺失」写进指纹，图标后来生成了也不重跑。
-- 嵌 exe 是唯一办法：gpui 的 `WindowOptions::icon` 只对 X11 生效。
-- 完整流程（生成 / 预览 / 嵌入 / 验证）已在技能 **`gpui-app-icon`**（用户级）里，
-  含四个实测脚本，新项目直接照它做。
-
-## 测试模块的固定写法
-
-`use gpui_kit::*` 会把 GPUI 的 `#[gpui::test]` 带进来盖掉 std 的 `#[test]`，所以：
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::prelude::v1::test;   // 恢复 std 的 #[test]
-}
-```
+`gpui-component-patterns`（界面套路与坑）、`gpui-ui-testing`（无头窗口测试配方）、
+`app-data-relocation`（数据目录可搬）、`gpui-theming`、`gpui-gui-automation`、
+`gpui-app-icon`、`http-rate-limit-breaker`。

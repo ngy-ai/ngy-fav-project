@@ -34,3 +34,64 @@ pub fn copyable(text: impl Into<SharedString>) -> SelectableText {
 pub fn copyable_as(id: impl Into<ElementId>, text: impl Into<SharedString>) -> SelectableText {
     SelectableText::new(id, text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt as _;
+
+    /// 一个最小界面：一整行能点，行里那段字能选。真实界面里这两件事经常挤在
+    /// 同一处（下拉框的每一行、仓库列表的每一行），所以这里就按那个形状摆。
+    struct Row {
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for Row {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            div()
+                .id("row")
+                .test_support()
+                .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+                .child(
+                    div()
+                        .id("row-text")
+                        .test_support()
+                        .child(copyable("仓库名 owner/repo")),
+                )
+        }
+    }
+
+    /// 这条测试是给一处**曾经的想当然**兜底的：当时以为「可选中的文本会插一层
+    /// hitbox，把外层的点击吃掉」，所以按钮、列表行里一律不敢用可复制的文本。
+    /// 实际不是——`SelectableText` 的 hitbox 是普通行为（`HitboxBehavior::Normal`），
+    /// gpui 的命中测试会把包含指针的每一层 hitbox 都算进来，父级的
+    /// `hitbox.is_hovered()` 照样为真，点击照常冒泡上去。
+    ///
+    /// 于是「点名字 = 触发整行」和「划名字 = 选中文字」可以同时成立。
+    #[gpui_kit::test]
+    fn clicking_text_still_reaches_the_row_around_it(cx: &mut TestAppContext) {
+        let clicks = Rc::new(Cell::new(0));
+        let handle = cx.add_window(|_, _| Row {
+            clicks: clicks.clone(),
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // 点的是**文字那一块**的中心，不是行里的空白处。
+            window.click("row-text", cx);
+        })
+        .unwrap();
+
+        assert_eq!(
+            clicks.get(),
+            1,
+            "点在可选中的文字上，外层的点击照样要收到"
+        );
+    }
+}

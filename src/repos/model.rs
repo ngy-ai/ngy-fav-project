@@ -111,10 +111,20 @@ pub enum CategoryScope {
 }
 
 /// 一次列表查询的条件。
+///
+/// 四个维度之间是**且**的关系：分类、语言、标签各自筛一遍，谁都满足才留下。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoQuery {
     pub search: String,
     pub category: CategoryFilter,
+    /// 按编程语言精确筛选。`None` 是「不限语言」——注意它跟「没有语言」不是
+    /// 一回事：后者是还没补元数据的仓库，不该被当成一种语言来选。
+    pub language: Option<String>,
+    /// 要**同时**具备的标签名。空就是不限。
+    ///
+    /// 按词表顺序存而不是按点击先后：同样的选择集合必须写出同样的条件，
+    /// 否则「条件没变就不重查」这类比较会因为点单顺序不同而失效。
+    pub tags: Vec<String>,
     /// 从 0 开始的页码。
     pub page: usize,
     pub page_size: usize,
@@ -125,9 +135,23 @@ impl Default for RepoQuery {
         Self {
             search: String::new(),
             category: CategoryFilter::All,
+            language: None,
+            tags: Vec::new(),
             page: 0,
             page_size: DEFAULT_PAGE_SIZE,
         }
+    }
+}
+
+impl RepoQuery {
+    /// 任何一个维度上加了条件。
+    ///
+    /// 「一个都没筛」与「筛完什么都不剩」要说不同的话，靠它来分。
+    pub fn has_filters(&self) -> bool {
+        !self.search.trim().is_empty()
+            || self.category != CategoryFilter::All
+            || self.language.is_some()
+            || !self.tags.is_empty()
     }
 }
 
@@ -138,6 +162,12 @@ pub struct RepoQuerySpec {
     pub category: CategoryScope,
     /// 搜索词命中的分类节点（含它们的后代）。搜索时用得上。
     pub search_categories: Vec<i64>,
+    /// 语言的原始写法。`repos.language` 存的就是 GitHub 给的那个字符串，
+    /// 不做大小写归一——`Rust` 和 `rust` 在 GitHub 上是同一个，但库里只有一种写法。
+    pub language: Option<String>,
+    /// 标签的 [`name_key`](crate::taxonomy::model::name_key)（小写）。比较走它，
+    /// 词表里存的是第一次出现的写法。
+    pub tags: Vec<String>,
     pub offset: usize,
     pub limit: usize,
 }

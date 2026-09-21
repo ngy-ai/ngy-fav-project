@@ -24,7 +24,7 @@ use crate::repos::model::{
 };
 use crate::shared::relocate::{self, MoveStrategy};
 use crate::shared::store;
-use crate::taxonomy::model::{self as tax, AddName, RenameName, Tag, TaxonomyKind};
+use crate::taxonomy::model::{self as tax, AddName, MoveName, RenameName, Tag, TaxonomyKind};
 use crate::taxonomy::tree::{CategoryTree, FlatCategory};
 
 /// 入库结果。调用方需要知道是新增还是重复，好把结果说给用户听。
@@ -55,6 +55,20 @@ pub struct CategoryRow {
     pub children: usize,
     /// 属于这个分类的仓库数，**含它的整棵子树**——「开发」底下挂了多少，
     /// 把「开发/前端」的算上才说得通。
+    pub repos: usize,
+}
+
+/// 筛选条上的一个可选项：一种编程语言，或一个标签；后面跟着有多少仓库用它。
+///
+/// 语言与标签的形状一模一样（名字 + 计数），所以共用一个——顺序各自由
+/// [`Library::language_rows`] 与 [`Library::tag_rows`] 决定。
+///
+/// 计数一律是**全库**的数，跟分类筛选条上的数字一个口径：它回答的是「选它会看到
+/// 多少」，而不是「在现在这堆条件里还剩下多少」。后者要按维度交叉重算，用户
+/// 读起来也更绕。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FacetRow {
+    pub name: String,
     pub repos: usize,
 }
 
@@ -664,6 +678,12 @@ impl Library {
             },
             search,
             category,
+            // 语言原样带下去：`repos.language` 里存的就是 GitHub 给的那个字符串，
+            // 库里只有一种写法，不需要归一。
+            language: query.language.clone(),
+            // 标签比较走小写 key —— 词表里存的是第一次出现的写法（可能是 `CLI`），
+            // 而用户点的那一行交给我们的就是词表里的写法，两边都得能对上。
+            tags: query.tags.iter().map(|name| tax::name_key(name)).collect(),
             offset: query.page * page_size,
             limit: page_size,
         }
@@ -921,6 +941,48 @@ impl Library {
         RenameName::Renamed
     }
 
+    /// 把词表里的一项在同级里往前/往后挪一格。`delta` 为负往前、为正往后。
+    ///
+    /// 顺序只是界面上的摆放：分类的父子关系记在 `parent_id` 上，仓库的分类记在节点
+    /// id 上，标签关联也记在 id 上——所以挪位置不动任何归属，不用回写仓库那一行。
+    /// 和改名、删除一样，写库成功之后整批重读。
+    pub fn move_name(&mut self, kind: TaxonomyKind, name: &str, delta: i64) -> MoveName {
+        match kind {
+            TaxonomyKind::Category => self.move_category_name(name, delta),
+            TaxonomyKind::Tag => self.move_tag_name(name, delta),
+        }
+    }
+
+    fn move_category_name(&mut self, name: &str, delta: i64) -> MoveName {
+        let Some(id) = self.categories.find_path(name) else {
+            return MoveName::NotFound;
+        };
+        let Some(moved) = self.write(|db| db::taxonomy::reorder_category(db.conn(), id, delta))
+        else {
+            return MoveName::Failed;
+        };
+        if !moved {
+            return MoveName::AtEdge;
+        }
+        self.reload_categories();
+        MoveName::Moved
+    }
+
+    fn move_tag_name(&mut self, name: &str, delta: i64) -> MoveName {
+        let Some(tag) = self.tag_named(name) else {
+            return MoveName::NotFound;
+        };
+        let id = tag.id;
+        let Some(moved) = self.write(|db| db::taxonomy::reorder_tag(db.conn(), id, delta)) else {
+            return MoveName::Failed;
+        };
+        if !moved {
+            return MoveName::AtEdge;
+        }
+        self.reload_tags();
+        MoveName::Moved
+    }
+
     /// 从词表里删掉一个名字。返回受影响的仓库数量，调用方据此说明后果。
     ///
     /// 分类是**连子树一起删**：删掉 `开发` 之后它下面的分类也都不在了，那些仓库
@@ -1005,6 +1067,62 @@ impl Library {
             .iter()
             .filter(|repo| repo.category_id.is_none())
             .count()
+    }
+
+    /// 筛选条上的语言清单：全库出现过的语言各有多少仓库。
+    ///
+    /// 按数量从多到少排——语言是枚举值，用户找的是「哪个语言最多」，而不是
+    /// 「R 开头的那个在第几屏」。数量相同再按名字，顺序才稳定：同一份数据每次都
+    /// 算得出同一个次序，点开下拉时行不会跳来跳去。
+    pub fn language_rows(&self) -> Vec<FacetRow> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for repo in &self.repos {
+            // 空串与「没有语言」是一回事：抓元数据时可能写进一个空串。
+            let Some(name) = repo
+                .language
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            *counts.entry(name).or_default() += 1;
+        }
+
+        let mut rows: Vec<FacetRow> = counts
+            .into_iter()
+            .map(|(name, repos)| FacetRow {
+                name: name.to_string(),
+                repos,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.repos.cmp(&a.repos).then_with(|| a.name.cmp(&b.name)));
+        rows
+    }
+
+    /// 筛选条上的标签清单，**按词表顺序**：词表是用户自己维护的，那个顺序就是他
+    /// 心里的顺序，重排等于替他改主意。
+    ///
+    /// 一个仓库都没挂过的标签也留着——数字 0 正好说明它还没被用上，
+    /// 跟分类树里那些空分类是同一个道理。
+    pub fn tag_rows(&self) -> Vec<FacetRow> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for repo in &self.repos {
+            for name in &repo.tags {
+                *counts.entry(tax::name_key(name)).or_default() += 1;
+            }
+        }
+
+        self.tags
+            .iter()
+            .map(|tag| FacetRow {
+                name: tag.name.clone(),
+                repos: counts
+                    .get(&tax::name_key(&tag.name))
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// 给仓库定分类；`None` 表示移出分类（回到未分类）。
@@ -1644,6 +1762,91 @@ mod tests {
         );
     }
 
+    /// 前后挪一格换的是**同级**里的邻居。顺带钉住两件事：挪位置不动任何归属，
+    /// 挪不动的那几次一条都不改。
+    #[test]
+    fn moving_a_name_swaps_it_with_its_sibling() {
+        let mut library = library_with_repos("move-name");
+        library.add_name(TaxonomyKind::Category, "工具/命令行");
+        library.add_name(TaxonomyKind::Category, "工具/编辑器");
+        assert!(library.set_repo_category("a/one", Some("工具/命令行")));
+
+        // 顶层：学习 往前换的是 工具。
+        assert_eq!(
+            library.move_name(TaxonomyKind::Category, "学习", -1),
+            MoveName::Moved
+        );
+        assert_eq!(
+            library.names(TaxonomyKind::Category),
+            ["学习", "工具", "工具/命令行", "工具/编辑器"]
+        );
+
+        // 子分类只在它自己那一层里换：命令行 往后遇到的是编辑器，不是顶层的谁。
+        assert_eq!(
+            library.move_name(TaxonomyKind::Category, "工具/命令行", 1),
+            MoveName::Moved
+        );
+        assert_eq!(
+            library.names(TaxonomyKind::Category),
+            ["学习", "工具", "工具/编辑器", "工具/命令行"]
+        );
+        assert_eq!(
+            library.repo_category_path("a/one").as_deref(),
+            Some("工具/命令行"),
+            "挪的是位置，仓库还挂在原来那个分类下"
+        );
+
+        assert_eq!(
+            library.move_name(TaxonomyKind::Category, "学习", -1),
+            MoveName::AtEdge,
+            "已经在最前面"
+        );
+        assert_eq!(
+            library.move_name(TaxonomyKind::Category, "工具/命令行", 1),
+            MoveName::AtEdge,
+            "已经在同级最后"
+        );
+        assert_eq!(
+            library.move_name(TaxonomyKind::Category, "没有这个", 1),
+            MoveName::NotFound
+        );
+        assert_eq!(
+            library.names(TaxonomyKind::Category),
+            ["学习", "工具", "工具/编辑器", "工具/命令行"],
+            "挪不动的那几次一条都没改"
+        );
+    }
+
+    /// 摆好的顺序是要留到下次启动的，不是这一屏里的临时效果。
+    #[test]
+    fn a_moved_order_is_still_there_after_a_restart() {
+        let path = unique_dir("move-order").join("library.db");
+        let mut library = Library::load_from(path.clone());
+        library.add_name(TaxonomyKind::Tag, "cli");
+        library.add_name(TaxonomyKind::Tag, "待读");
+        library.add_name(TaxonomyKind::Category, "工具");
+        library.add_name(TaxonomyKind::Category, "学习");
+
+        assert_eq!(
+            library.move_name(TaxonomyKind::Tag, "cli", 1),
+            MoveName::Moved
+        );
+        assert_eq!(
+            library.move_name(TaxonomyKind::Category, "学习", -1),
+            MoveName::Moved
+        );
+
+        let reloaded = Library::load_from(path);
+        assert_eq!(
+            reloaded.names(TaxonomyKind::Tag),
+            ["待读".to_string(), "cli".to_string()]
+        );
+        assert_eq!(
+            reloaded.names(TaxonomyKind::Category),
+            ["学习".to_string(), "工具".to_string()]
+        );
+    }
+
     #[test]
     fn removing_a_category_uncategorizes_its_repos() {
         let mut library = library_with_repos("remove-category");
@@ -1971,6 +2174,96 @@ mod tests {
             ..query()
         });
         assert_eq!(gone.total, 0);
+    }
+
+    #[test]
+    fn language_and_tags_filter_together_with_the_category() {
+        let mut library = temp_library("facet-filter");
+        library.add_name(TaxonomyKind::Tag, "cli");
+        library.add_name(TaxonomyKind::Tag, "待读");
+
+        for (name, language, tags) in [
+            ("a/rust", Some("Rust"), &["cli"][..]),
+            ("b/go", Some("Go"), &["cli", "待读"][..]),
+            ("c/plain", None, &[][..]),
+        ] {
+            let mut repo = Repo::new(name.to_string(), None, 1);
+            repo.language = language.map(str::to_string);
+            repo.tags = tags.iter().map(|tag| tag.to_string()).collect();
+            library.add_repo(repo);
+        }
+
+        let by_language = library.query_repos(&RepoQuery {
+            language: Some("Rust".to_string()),
+            ..query()
+        });
+        assert_eq!(by_language.total, 1);
+        assert_eq!(by_language.rows[0].id, "a/rust");
+
+        // 两个标签都得挂着才算：b/go 两个都有，a/rust 只有 cli。
+        let by_tags = library.query_repos(&RepoQuery {
+            tags: vec!["cli".to_string(), "待读".to_string()],
+            ..query()
+        });
+        assert_eq!(by_tags.total, 1);
+        assert_eq!(by_tags.rows[0].id, "b/go");
+
+        // 维度之间是且：用 Rust 的那条没挂「待读」。
+        let both = library.query_repos(&RepoQuery {
+            language: Some("Rust".to_string()),
+            tags: vec!["待读".to_string()],
+            ..query()
+        });
+        assert_eq!(both.total, 0);
+
+        // 词表里存什么写法都行，筛选用的大小写不影响结果。
+        let upper = library.query_repos(&RepoQuery {
+            tags: vec!["CLI".to_string()],
+            ..query()
+        });
+        assert_eq!(upper.total, 2);
+    }
+
+    #[test]
+    fn the_facet_lists_count_what_is_in_use() {
+        let mut library = temp_library("facets");
+        library.add_name(TaxonomyKind::Tag, "cli");
+        library.add_name(TaxonomyKind::Tag, "没用过的");
+
+        for (name, language, tags) in [
+            ("a/one", Some("Rust"), &["cli"][..]),
+            ("b/two", Some("Rust"), &[][..]),
+            ("c/three", Some("Go"), &[][..]),
+            // 空白的语言与「没有语言」是一回事，不该出现在清单里。
+            ("d/four", Some("   "), &[][..]),
+        ] {
+            let mut repo = Repo::new(name.to_string(), None, 1);
+            repo.language = language.map(str::to_string);
+            repo.tags = tags.iter().map(|tag| tag.to_string()).collect();
+            library.add_repo(repo);
+        }
+
+        let languages: Vec<(String, usize)> = library
+            .language_rows()
+            .into_iter()
+            .map(|row| (row.name, row.repos))
+            .collect();
+        assert_eq!(
+            languages,
+            [("Rust".to_string(), 2), ("Go".to_string(), 1)],
+            "多的在前，空白语言不算一种语言"
+        );
+
+        let tags: Vec<(String, usize)> = library
+            .tag_rows()
+            .into_iter()
+            .map(|row| (row.name, row.repos))
+            .collect();
+        assert_eq!(
+            tags,
+            [("cli".to_string(), 1), ("没用过的".to_string(), 0)],
+            "按词表顺序；没挂过也留着，那个 0 正好说明它还没用上"
+        );
     }
 
     #[test]

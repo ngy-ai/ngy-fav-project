@@ -133,6 +133,23 @@ fn build_filter(spec: &RepoQuerySpec) -> (String, Vec<Value>) {
         }
     }
 
+    if let Some(language) = &spec.language {
+        // 精确相等而不是 LIKE：语言名是枚举值，`Go` 不该把 `Gosu` 也捞进来。
+        conditions.push("r.language = ?".to_string());
+        params.push(Value::Text(language.clone()));
+    }
+
+    for tag in &spec.tags {
+        // 每个标签一个 EXISTS，几个标签就是「几个都得挂上」。比 `IN` 再数一遍
+        // 更好读，参数顺序也跟标签顺序一一对得上。
+        conditions.push(
+            "EXISTS (SELECT 1 FROM repo_tags rt JOIN tags t ON t.id = rt.tag_id \
+             WHERE rt.repo_id = r.id AND t.name_key = ?)"
+                .to_string(),
+        );
+        params.push(Value::Text(tag.clone()));
+    }
+
     if let Some(pattern) = &spec.search {
         let mut parts = vec![
             "r.full_name LIKE ? ESCAPE '\\'".to_string(),
@@ -313,6 +330,8 @@ mod tests {
             search: None,
             category: CategoryScope::All,
             search_categories: Vec::new(),
+            language: None,
+            tags: Vec::new(),
             offset: 0,
             limit: 10,
         }
@@ -415,9 +434,128 @@ mod tests {
         assert_eq!(rows[0].full_name, "rust-lang/rust", "标签也能搜到");
     }
 
+    /// 三个仓库，语言分别是 Rust / Rust / Go，用来验证语言筛选。
+    fn three_languages(conn: &Connection) {
+        for (name, language) in [("a/one", "Rust"), ("b/two", "Rust"), ("c/three", "Go")] {
+            let mut repo = repo(name, 1);
+            repo.language = Some(language.to_string());
+            insert(conn, &repo, &[]).unwrap();
+        }
+    }
+
     #[test]
-    fn an_empty_subtree_scope_matches_nothing() {
+    fn language_matches_the_whole_name_and_nothing_else() {
         let db = db();
+        let conn = db.conn();
+        three_languages(conn);
+        // 名字带前缀的那种：筛 Go 不该把 Gosu 也捞进来。
+        let mut gosu = repo("d/four", 1);
+        gosu.language = Some("Gosu".to_string());
+        insert(conn, &gosu, &[]).unwrap();
+
+        let (rows, total) = query_page(
+            conn,
+            &RepoQuerySpec {
+                language: Some("Go".to_string()),
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].full_name, "c/three");
+
+        let (rows, _) = query_page(
+            conn,
+            &RepoQuerySpec {
+                language: Some("Rust".to_string()),
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn several_tags_must_all_be_present() {
+        let db = db();
+        let conn = db.conn();
+        for (id, name) in [(1, "cli"), (2, "待读")] {
+            conn.execute(
+                "INSERT INTO tags (id, name, name_key, position) VALUES (?1, ?2, ?2, ?1)",
+                params![id, name],
+            )
+            .unwrap();
+        }
+        insert(conn, &repo("a/both", 1), &[1, 2]).unwrap();
+        insert(conn, &repo("b/only-cli", 2), &[1]).unwrap();
+        insert(conn, &repo("c/neither", 3), &[]).unwrap();
+
+        let (rows, total) = query_page(
+            conn,
+            &RepoQuerySpec {
+                tags: vec!["cli".to_string(), "待读".to_string()],
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 1, "两个标签都要有，不是有一个就算");
+        assert_eq!(rows[0].full_name, "a/both");
+
+        let (rows, _) = query_page(
+            conn,
+            &RepoQuerySpec {
+                tags: vec!["cli".to_string()],
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn tag_comparison_ignores_case_because_the_key_is_lowercased() {
+        let db = db();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO tags (id, name, name_key, position) VALUES (1, 'CLI', 'cli', 0)",
+            [],
+        )
+        .unwrap();
+        insert(conn, &repo("a/one", 1), &[1]).unwrap();
+
+        let (rows, _) = query_page(
+            conn,
+            &RepoQuerySpec {
+                tags: vec!["cli".to_string()],
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "词表里存的是 CLI，筛选用小写也得对上");
+    }
+
+    #[test]
+    fn an_unknown_language_or_tag_matches_nothing_instead_of_everything() {
+        // 语言被改名、标签被删掉之后，筛选项就不该悄悄退回「全部」——那会让用户
+        // 以为筛选没生效。跟分类那个空子树是同一个道理。
+        let db = db();
+        let conn = db.conn();
+        three_languages(conn);
+
+        let (rows, _) = query_page(
+            conn,
+            &RepoQuerySpec {
+                language: Some("Rustlang".to_string()),
+                tags: vec!["没有这个标签".to_string()],
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn an_empty_subtree_scope_matches_nothing() {        let db = db();
         let conn = db.conn();
         insert(conn, &repo("a/one", 1), &[]).unwrap();
 

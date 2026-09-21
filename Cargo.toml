@@ -20,6 +20,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+[dev-dependencies]
+# 界面测试台（`#[gpui_kit::test]`）：在无头窗口里渲染真实界面、按 id 点元素、断言
+# 状态。界面层本来只能靠人手点，「点开下拉框 → 点中一行 → 列表跟着筛」这种规则
+# 就没人盯着；有了它，凡是「只有跑起来才说得清」的部分也能进 cargo test。
+# 只在测试构建里生效，不进最终 exe（生产代码里的 .test_support() 也退化成 no-op）。
+gpui-kit = { version = "0.6.4", features = ["test-support"] }
+
 [profile.dev]
 # GPUI 的布局 / 文本 / 渲染代码在未优化时慢到不可用，只对这几层开优化。
 debug = "limited"

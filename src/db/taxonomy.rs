@@ -131,6 +131,80 @@ pub fn delete_tag(conn: &Connection, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 在同级里把某个分类往前/往后挪一格。`delta` 为负往前、为正往后。
+///
+/// **只动同级**：`开发/前端` 往前挪，换的是它上面那个兄弟的位置，不会跑到别的
+/// 上级底下去。返回 `false` 表示已经在头或尾，没有可挪的余地，这时一条都没改。
+pub fn reorder_category(conn: &Connection, id: i64, delta: i64) -> DbResult<bool> {
+    // 找不到这个 id 就什么都没得挪。`parent_id` 本身可能是 NULL（顶层），
+    // 所以这里是「两层 Option」：外面那层说有没有这个节点。
+    let found: Option<Option<i64>> = conn
+        .query_row("SELECT parent_id FROM categories WHERE id = ?", [id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(parent) = found else {
+        return Ok(false);
+    };
+
+    let mut ids = ordered_ids(
+        conn,
+        "SELECT id FROM categories WHERE parent_id IS ?1 ORDER BY position, id",
+        params![parent],
+    )?;
+    if !shifted(&mut ids, id, delta) {
+        return Ok(false);
+    }
+    rewrite_positions(conn, "categories", &ids)?;
+    Ok(true)
+}
+
+/// 标签是扁平的，整张表就是它的同级。
+pub fn reorder_tag(conn: &Connection, id: i64, delta: i64) -> DbResult<bool> {
+    let mut ids = ordered_ids(conn, "SELECT id FROM tags ORDER BY position, id", [])?;
+    if !shifted(&mut ids, id, delta) {
+        return Ok(false);
+    }
+    rewrite_positions(conn, "tags", &ids)?;
+    Ok(true)
+}
+
+/// 读出一串 id，顺序就是现在界面上的顺序。
+fn ordered_ids(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> DbResult<Vec<i64>> {
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement.query_map(params, |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// 把 `id` 在 `ids` 里挪 `delta` 格。挪不动（已经在两头、或者压根不在里面）时
+/// 返回 `false`，此时 `ids` 一格都没动。
+fn shifted(ids: &mut [i64], id: i64, delta: i64) -> bool {
+    let Some(at) = ids.iter().position(|it| *it == id) else {
+        return false;
+    };
+    let target = at as i64 + delta;
+    if target < 0 || target as usize >= ids.len() {
+        return false;
+    }
+    ids.swap(at, target as usize);
+    true
+}
+
+/// 按 `ids` 的顺序把整段同级的 `position` 重写成 0..n。
+///
+/// 不是只交换两条 `position` 就完事：老数据里同一个上级下面可能有好几条 `position`
+/// 相同（早期导入、手工改过库），只换两条的话下一次排序又按 id 把它们摆回去，
+/// 看起来像「点了没反应」。整段重写一遍，顺序才算真定下来。
+fn rewrite_positions(conn: &Connection, table: &str, ids: &[i64]) -> DbResult<()> {
+    // 表名是这里写死的字面量，不是外面传进来的东西。
+    let sql = format!("UPDATE {table} SET position = ?1 WHERE id = ?2");
+    let mut statement = conn.prepare(&sql)?;
+    for (position, id) in ids.iter().enumerate() {
+        statement.execute(params![position as i64, id])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +306,126 @@ mod tests {
         let conn = db.conn();
         insert_tag(conn, "AI").unwrap();
         assert!(insert_tag(conn, "ai").is_err(), "大小写不同还是同一个标签");
+    }
+
+    /// 整棵树的路径顺序，铺平了看最直观。
+    fn paths(conn: &Connection) -> Vec<String> {
+        crate::taxonomy::tree::CategoryTree::from_nodes(load_categories(conn).unwrap())
+            .flatten()
+            .into_iter()
+            .map(|node| node.path)
+            .collect()
+    }
+
+    /// 往前后挪一格换的是**同级**里的邻居。子分类挪到头也不会跑到顶层去——
+    /// 同级按 `parent_id` 划，跟层级没有关系。
+    #[test]
+    fn siblings_move_within_their_own_level() {
+        let db = db();
+        let conn = db.conn();
+        let dev = insert_category(conn, None, "开发").unwrap();
+        insert_category(conn, None, "学习").unwrap();
+        insert_category(conn, Some(dev), "前端").unwrap();
+        let back = insert_category(conn, Some(dev), "后端").unwrap();
+
+        assert_eq!(
+            paths(conn),
+            ["开发", "开发/前端", "开发/后端", "学习"],
+            "一开始是建立的顺序"
+        );
+
+        assert!(reorder_category(conn, back, -1).unwrap(), "后端往前换到前端前面");
+        assert_eq!(paths(conn), ["开发", "开发/后端", "开发/前端", "学习"]);
+
+        // 顶层两条：把「学习」往前挪，换的是「开发」，不是某个子分类。
+        let study = crate::taxonomy::tree::CategoryTree::from_nodes(
+            load_categories(conn).unwrap(),
+        )
+        .find_path("学习")
+        .expect("刚刚建过");
+        assert!(reorder_category(conn, study, -1).unwrap());
+        assert_eq!(
+            paths(conn),
+            ["学习", "开发", "开发/后端", "开发/前端"],
+            "顶层换了位，子分类跟着上级走"
+        );
+    }
+
+    /// 已经在两头就没有余地了：返回 `false` 且一条都不改。
+    #[test]
+    fn moving_past_the_edge_changes_nothing() {
+        let db = db();
+        let conn = db.conn();
+        let first = insert_category(conn, None, "开发").unwrap();
+        insert_category(conn, None, "学习").unwrap();
+        let only = insert_category(conn, Some(first), "前端").unwrap();
+
+        assert!(!reorder_category(conn, first, -1).unwrap(), "它已经在最前面");
+        assert!(!reorder_category(conn, only, 1).unwrap(), "独苗也没得挪");
+        assert!(!reorder_category(conn, only, -1).unwrap());
+        assert!(!reorder_category(conn, 9999, 1).unwrap(), "不在库里");
+        assert_eq!(paths(conn), ["开发", "开发/前端", "学习"]);
+    }
+
+    /// 老数据里同一个上级下可能有好几条 `position` 相同——只交换两条的话，
+    /// 下次排序又会按 id 摆回去，看起来像「点了没反应」。所以整段重写一遍。
+    #[test]
+    fn duplicated_positions_are_normalized_while_moving() {
+        let db = db();
+        let conn = db.conn();
+        let dev = insert_category(conn, None, "开发").unwrap();
+        let mut ids = Vec::new();
+        for name in ["a", "b", "c"] {
+            conn.execute(
+                "INSERT INTO categories (parent_id, name, name_key, position) \
+                 VALUES (?1, ?2, ?2, 0)",
+                params![dev, name],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+
+        // position 全相同时的顺序是 id 序：a, b, c。
+        assert_eq!(paths(conn), ["开发", "开发/a", "开发/b", "开发/c"]);
+        assert!(reorder_category(conn, ids[2], -1).unwrap(), "c 往前一格");
+
+        assert_eq!(
+            paths(conn),
+            ["开发", "开发/a", "开发/c", "开发/b"],
+            "真的换了，没有被 id 序盖回去"
+        );
+        let positions: Vec<i64> = {
+            let mut statement = conn
+                .prepare("SELECT position FROM categories WHERE parent_id = ?1 ORDER BY position, id")
+                .unwrap();
+            statement
+                .query_map([dev], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(positions, [0, 1, 2], "整段重写成 0..n，不再有并列");
+    }
+
+    /// 标签是扁平的，整张表就是它的同级。
+    #[test]
+    fn tags_move_in_the_flat_list() {
+        let db = db();
+        let conn = db.conn();
+        let cli = insert_tag(conn, "cli").unwrap();
+        let later = insert_tag(conn, "待读").unwrap();
+
+        assert!(reorder_tag(conn, cli, 1).unwrap());
+        let names: Vec<String> = load_tags(conn)
+            .unwrap()
+            .into_iter()
+            .map(|tag| tag.name)
+            .collect();
+        assert_eq!(names, ["待读", "cli"]);
+
+        assert!(!reorder_tag(conn, cli, 1).unwrap(), "已经在最后了");
+        assert!(reorder_tag(conn, later, 1).unwrap(), "换回来");
+        assert_eq!(load_tags(conn).unwrap()[0].name, "cli");
+        assert!(!reorder_tag(conn, 9999, -1).unwrap(), "不在库里");
     }
 }
