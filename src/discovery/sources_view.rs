@@ -16,6 +16,7 @@ use crate::discovery::model::{DiscoverySource, SourceRun, validate_source_url};
 use crate::discovery::runner::{DiscoveryRunner, RunPhase};
 use crate::library::{AddOutcome, Library};
 use crate::shared::clock::{format_local_minute, format_relative, now_unix};
+use crate::shared::text::{copyable, copyable_as};
 
 /// 页面要用到的主题色。`Theme` 借自 `cx`，用之前先抄成值，
 /// 免得后面还要 `&mut cx` 时和它撞上。
@@ -189,14 +190,19 @@ impl SourcesView {
                 h_flex()
                     .gap_2()
                     .child(div().size_2().rounded_full().flex_shrink_0().bg(dot_color))
-                    .child(div().text_sm().text_color(palette.foreground).child(headline)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(palette.foreground)
+                            .child(copyable(headline)),
+                    ),
             )
             .when_some(next_run, |this, at| {
                 this.child(
                     div()
                         .text_xs()
                         .text_color(palette.muted)
-                        .child(format!("下次自动运行：{}", format_local_minute(at))),
+                        .child(copyable(format!("下次自动运行：{}", format_local_minute(at)))),
                 )
             })
             .when_some(blocked_until, |this, until| {
@@ -205,10 +211,11 @@ impl SourcesView {
                     div()
                         .text_xs()
                         .text_color(palette.warning)
-                        .child(format!(
-                            "GitHub 接口配额已用完，已停止联网；约 {minutes} 分钟后（{} 起）自动恢复",
+                        .child(copyable(format!(
+                            "GitHub 接口配额已用完，已停止联网；约 {minutes} 分钟后（{} 起）自动恢复。\
+                             在「设置」里填一个访问令牌可立即恢复，配额提升到 5000 次/小时",
                             format_local_minute(until)
-                        )),
+                        ))),
                 )
             })
             .when(ran_before && last_added > 0, |this| {
@@ -216,7 +223,7 @@ impl SourcesView {
                     div()
                         .text_xs()
                         .text_color(palette.muted)
-                        .child(format!("上次新增 {last_added} 个仓库")),
+                        .child(copyable(format!("上次新增 {last_added} 个仓库"))),
                 )
             })
             .when_some(
@@ -226,7 +233,7 @@ impl SourcesView {
                         div()
                             .text_xs()
                             .text_color(palette.muted)
-                            .child(format!("GitHub 接口剩余配额：{remaining} 次/小时")),
+                            .child(copyable(format!("GitHub 接口剩余配额：{remaining} 次/小时"))),
                     )
                 },
             )
@@ -235,7 +242,7 @@ impl SourcesView {
                     div()
                         .text_xs()
                         .text_color(palette.warning)
-                        .child(format!("上次运行有失败项：{error}")),
+                        .child(copyable(format!("上次运行有失败项：{error}"))),
                 )
             })
             .into_any_element()
@@ -273,7 +280,10 @@ impl SourcesView {
                                             .text_sm()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .truncate()
-                                            .child(name.clone()),
+                                            .child(copyable_as(
+                                                format!("source-name:{url}"),
+                                                name.clone(),
+                                            )),
                                     )
                                     .when(failed, |this| {
                                         this.child(
@@ -289,7 +299,7 @@ impl SourcesView {
                                     .text_xs()
                                     .text_color(palette.muted)
                                     .truncate()
-                                    .child(url.clone()),
+                                    .child(copyable_as(format!("source-url:{url}"), url.clone())),
                             ),
                     )
                     .child(
@@ -344,7 +354,7 @@ impl SourcesView {
                 div()
                     .text_xs()
                     .text_color(if failed { palette.warning } else { palette.muted })
-                    .child(last_run_text),
+                    .child(copyable_as(format!("source-run:{url}"), last_run_text)),
             )
             .into_any_element()
     }

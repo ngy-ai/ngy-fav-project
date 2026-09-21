@@ -26,6 +26,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::repos::model::{CategoryFilter, DEFAULT_PAGE_SIZE, RepoId, RepoPage, RepoQuery, RepoRow};
+use crate::shared::text::{copyable, copyable_as};
 use crate::taxonomy::chip;
 
 pub struct RepoListDelegate {
@@ -211,18 +212,25 @@ impl ListDelegate for RepoListDelegate {
                                         .min_w_0()
                                         .text_sm()
                                         .truncate()
-                                        .child(row.full_name.clone()),
+                                        .child(copyable(row.full_name.clone())),
                                 )
                                 .when_some(category, |this, (path, leaf)| {
                                     this.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .child(chip::category_leaf_tag(&path, &leaf, dark)),
+                                        div().flex_shrink_0().child(chip::category_leaf_tag(
+                                            format!("repo-category:{}", row.id),
+                                            &path,
+                                            &leaf,
+                                            dark,
+                                        )),
                                     )
                                 })
                                 .when_some(row.language.clone(), |this, language| {
                                     this.child(
-                                        div().flex_shrink_0().text_xs().text_color(muted).child(language),
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(copyable(language)),
                                     )
                                 })
                                 .when(row.pending_metadata, |this| {
@@ -231,7 +239,7 @@ impl ListDelegate for RepoListDelegate {
                                             .flex_shrink_0()
                                             .text_xs()
                                             .text_color(muted)
-                                            .child("待补全"),
+                                            .child(copyable("待补全")),
                                     )
                                 }),
                         )
@@ -242,7 +250,7 @@ impl ListDelegate for RepoListDelegate {
                                 .text_xs()
                                 .text_color(muted)
                                 .truncate()
-                                .child(row.subtitle.clone()),
+                                .child(copyable(row.subtitle.clone())),
                         ),
                 ),
         )
@@ -289,9 +297,11 @@ impl ListDelegate for RepoListDelegate {
             .p_4()
             .child(Icon::new(IconName::Inbox).size_8().text_color(muted))
             .child(
-                div()
-                    .text_sm()
-                    .child(if empty_library { "这里还没有仓库" } else { "没有符合条件的仓库" }),
+                div().text_sm().child(if empty_library {
+                    copyable_as("repos-empty-title-none", "这里还没有仓库")
+                } else {
+                    copyable_as("repos-empty-title-filtered", "没有符合条件的仓库")
+                }),
             )
             .child(
                 div()
@@ -299,9 +309,15 @@ impl ListDelegate for RepoListDelegate {
                     .text_color(muted)
                     .text_center()
                     .child(if empty_library {
-                        "点右上角「添加仓库」，或到「发现」页运行一次抓取"
+                        copyable_as(
+                            "repos-empty-hint-none",
+                            "点右上角「添加仓库」，或到「发现」页运行一次抓取",
+                        )
                     } else {
-                        "换个关键词，或把上方的分类筛选切回「全部」"
+                        copyable_as(
+                            "repos-empty-hint-filtered",
+                            "换个关键词，或把上方的分类筛选切回「全部」",
+                        )
                     }),
             )
     }

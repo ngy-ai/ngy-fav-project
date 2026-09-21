@@ -3,11 +3,15 @@
 //! 分类按名字取一个稳定的色相——同一个分类在详情、列表、管理页里永远是同一个
 //! 颜色，认颜色比读字快。标签统一走中性色：它出现的数量比分类多得多，各自上色
 //! 只会把界面吵成一片。
+//!
+//! 色块里的字是可以选中复制的（`copyable_as`），所以要带一个身份进来：这几个
+//! 函数是共用的，同一个位置会被渲染很多份，光靠代码位置分不开。
 
 use gpui_kit::component::{Sizable as _, tag::Tag};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::shared::text::copyable_as;
 use crate::taxonomy::model::hue_seed;
 
 /// 分类色块的三种颜色：底色、字色、描边。
@@ -35,32 +39,32 @@ pub fn category_colors(name: &str, dark: bool) -> (Hsla, Hsla, Hsla) {
 ///
 /// 颜色取自**整条路径**而不是末级名字：`开发/前端` 和 `工具/前端` 是两个分类，
 /// 不该长得一模一样。
-pub fn category_tag(name: &str, dark: bool) -> Tag {
+pub fn category_tag(id: impl Into<ElementId>, name: &str, dark: bool) -> Tag {
     let (background, foreground, border) = category_colors(name, dark);
     Tag::custom(background, foreground, border)
         .small()
         .rounded_full()
-        .child(name.to_string())
+        .child(copyable_as(id, name.to_string()))
 }
 
 /// 分类色块，只显示末级名字。
 ///
 /// `path` 决定颜色——`开发/前端` 与 `工具/前端` 是两个分类，不该长得一模一样；
 /// `leaf` 决定写什么字。列表行很窄，画不下整条路径。
-pub fn category_leaf_tag(path: &str, leaf: &str, dark: bool) -> Tag {
+pub fn category_leaf_tag(id: impl Into<ElementId>, path: &str, leaf: &str, dark: bool) -> Tag {
     let (background, foreground, border) = category_colors(path, dark);
     Tag::custom(background, foreground, border)
         .small()
         .rounded_full()
-        .child(leaf.to_string())
+        .child(copyable_as(id, leaf.to_string()))
 }
 
 /// 标签色块。前面带 `#`，一眼能和分类区分开。
-pub fn tag_tag(name: &str) -> Tag {
+pub fn tag_tag(id: impl Into<ElementId>, name: &str) -> Tag {
     Tag::secondary()
         .small()
         .rounded_full()
-        .child(format!("#{name}"))
+        .child(copyable_as(id, format!("#{name}")))
 }
 
 #[cfg(test)]

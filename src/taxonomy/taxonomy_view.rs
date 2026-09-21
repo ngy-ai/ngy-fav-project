@@ -276,10 +276,18 @@ impl TaxonomyView {
             .when(!is_last, |this| this.border_b_1().border_color(palette.border))
             .child(match kind {
                 // 缩进已经说明了它是谁的子级，这里只画末级名字；颜色仍取自整条路径。
-                TaxonomyKind::Category => {
-                    chip::category_leaf_tag(&row.name, &row.leaf, palette.dark).into_any_element()
+                // 色块的身份带上整条路径：不同的枝上可以有同名的一级（`开发/前端`
+                // 与 `工具/前端`）。
+                TaxonomyKind::Category => chip::category_leaf_tag(
+                    format!("taxonomy-category:{}", row.name),
+                    &row.name,
+                    &row.leaf,
+                    palette.dark,
+                )
+                .into_any_element(),
+                TaxonomyKind::Tag => {
+                    chip::tag_tag(format!("taxonomy-tag:{}", row.leaf), &row.leaf).into_any_element()
                 }
-                TaxonomyKind::Tag => chip::tag_tag(&row.leaf).into_any_element(),
             })
             .child(
                 h_flex()

@@ -20,6 +20,7 @@ use crate::discovery::SourcesView;
 use crate::library::{Library, SaveState};
 use crate::repos::ReposView;
 use crate::settings::SettingsView;
+use crate::shared::text::copyable;
 use crate::taxonomy::{TaxonomyKind, TaxonomyView};
 
 const SIDEBAR_WIDTH: f32 = 208.;
@@ -193,7 +194,13 @@ impl AppShell {
                                 .bg(muted),
                         )
                         .when(!collapsed, |this| {
-                            this.child(div().text_xs().text_color(muted).truncate().child(status.to_string()))
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .truncate()
+                                    .child(copyable(status.to_string())),
+                            )
                         }),
                 ),
             )
@@ -227,7 +234,7 @@ impl AppShell {
                     .child(self.page.title()),
             )
             .child(div().flex_1())
-            .child(div().text_xs().text_color(muted).child(status.to_string()))
+            .child(div().text_xs().text_color(muted).child(copyable(status.to_string())))
     }
 }
 

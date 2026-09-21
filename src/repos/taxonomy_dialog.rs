@@ -20,6 +20,7 @@ use gpui_kit::*;
 
 use crate::library::Library;
 use crate::repos::RepoId;
+use crate::shared::text::copyable_as;
 use crate::taxonomy::model::{self as tax, AddName, TaxonomyKind};
 
 /// 打开编辑框。当前归属从 `Library` 现读，仓库已经不在了就直接不开。
@@ -370,7 +371,12 @@ impl AssignmentDraft {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(kind.label()),
                     )
-                    .child(div().text_xs().text_color(muted).child(placeholder_note.to_string())),
+                    .child(
+                        div().text_xs().text_color(muted).child(copyable_as(
+                            format!("assign-note:{}", kind.label()),
+                            placeholder_note.to_string(),
+                        )),
+                    ),
             )
             .child(
                 h_flex()
@@ -378,10 +384,10 @@ impl AssignmentDraft {
                     .gap_1()
                     .when(!has_names, |this| {
                         this.child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("还没有{}，在下面新建", kind.label())),
+                            div().text_xs().text_color(muted).child(copyable_as(
+                                format!("assign-empty:{}", kind.label()),
+                                format!("还没有{}，在下面新建", kind.label()),
+                            )),
                         )
                     })
                     .children(chips),
@@ -393,7 +399,10 @@ impl AssignmentDraft {
                     .child(create),
             )
             .when_some(error, |this, error| {
-                this.child(div().text_xs().text_color(danger).child(error))
+                this.child(div().text_xs().text_color(danger).child(copyable_as(
+                    format!("assign-error:{}", kind.label()),
+                    error,
+                )))
             })
             .into_any_element()
     }

@@ -1,13 +1,19 @@
-//! 设置页：自动发现的开关与参数。
+//! 设置页：自动发现的开关与参数、GitHub 令牌，以及**数据放在哪**。
 //!
 //! 开关类配置改完立即生效；需要打字的三项（间隔、批次、令牌）配一个显式的
 //! 「应用」，并在旁边显示**当前生效值**——否则用户改完数字、忘了应用，
 //! 界面上看不出差别。
+//!
+//! 数据位置那一块不太一样：它改的是数据本身放在哪，所以走的是「选目录 →
+//! 搬家」这条实打实的路（见 [`Library::relocate`]）。新位置已经有数据时不替
+//! 用户做主，摆出三种处理办法让他挑。
+
+use std::path::PathBuf;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex,
-    button::Button,
+    ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+    button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, NumberInput},
     notification::Notification,
     switch::Switch,
@@ -17,6 +23,8 @@ use gpui_kit::*;
 
 use crate::discovery::model::DiscoverySettings;
 use crate::library::{Library, SaveState};
+use crate::shared::relocate::MoveStrategy;
+use crate::shared::text::copyable;
 
 /// 打字类配置的提交入口。三个字段共用一个方法，校验规则也集中在一处。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,8 +40,8 @@ fn clean_token(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// 一块带边框的设置面板。
-fn panel(radius: Pixels, border: Hsla, child: impl IntoElement) -> impl IntoElement {
+/// 一块带边框的设置面板。返回具体类型：下面还要往上挂「怎么处理已有数据」那一块。
+fn panel(radius: Pixels, border: Hsla, child: impl IntoElement) -> Div {
     v_flex()
         .gap_3()
         .p_4()
@@ -61,6 +69,8 @@ pub struct SettingsView {
     interval: Entity<InputState>,
     batch: Entity<InputState>,
     token: Entity<InputState>,
+    /// 选好了、但那边已经有数据，等用户挑怎么处理的那个目录。
+    pending_target: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -109,6 +119,7 @@ impl SettingsView {
             interval,
             batch,
             token,
+            pending_target: None,
             _subscriptions: subscriptions,
         }
     }
@@ -185,6 +196,64 @@ impl SettingsView {
             }
         }
     }
+
+    /// 弹系统目录选择框，选完交给 [`Self::consider_target`]。
+    ///
+    /// 选择框本身是异步的，所以挂个任务等它。等不到（用户取消、或者弹窗打不开）
+    /// 就什么都不做——取消是正常操作，不该弹提示。
+    fn pick_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选作数据目录".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            if let Some(dir) = picked {
+                let _ = this.update_in(cx, |this, window, cx| this.consider_target(dir, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// 目标位置拿到手之后：那边是空的就直接搬，已经有数据就先摆出三个选择。
+    fn consider_target(&mut self, target: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if Library::target_has_data(&target) {
+            self.pending_target = Some(target);
+            cx.notify();
+            return;
+        }
+        self.relocate(target, MoveStrategy::Overwrite, window, cx);
+    }
+
+    /// 真的动手搬。搬完（或者没搬成）都给一句准话。
+    fn relocate(
+        &mut self,
+        target: PathBuf,
+        strategy: MoveStrategy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let outcome = self.library.update(cx, |library, cx| {
+            let outcome = library.relocate(&target, strategy);
+            cx.notify();
+            outcome
+        });
+
+        match outcome {
+            Ok(report) => {
+                self.pending_target = None;
+                window.push_notification(Notification::success(report.note()), cx);
+            }
+            // 失败时把待选的那个位置留着：换一个处理办法再试一次是最可能的下一步。
+            Err(error) => window.push_notification(Notification::error(error), cx),
+        }
+        cx.notify();
+    }
 }
 
 impl Render for SettingsView {
@@ -209,6 +278,7 @@ impl Render for SettingsView {
             repo_count,
             source_count,
             path,
+            data_dir,
             save_state,
         ) = {
             let library = self.library.read(cx);
@@ -221,6 +291,7 @@ impl Render for SettingsView {
                 library.repo_count(),
                 library.sources().len(),
                 library.path().display().to_string(),
+                library.dir().to_path_buf(),
                 library.save_state().clone(),
             )
         };
@@ -351,6 +422,18 @@ impl Render for SettingsView {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.apply(Field::Token, window, cx);
                                 })),
+                        )
+                        .child(
+                            Button::new("open-token-settings")
+                                .icon(IconName::ExternalLink)
+                                .label("去申请")
+                                .ghost()
+                                .tooltip("在浏览器里打开 GitHub 的令牌页面")
+                                .on_click(|_, _, cx| {
+                                    // 给的是令牌列表页而不是「新建」页：已经有令牌的人
+                                    // 走到这里就不必再走一遍创建流程。
+                                    cx.open_url("https://github.com/settings/tokens");
+                                }),
                         ),
                 )
                 .child(
@@ -362,37 +445,124 @@ impl Render for SettingsView {
                         } else {
                             "当前：未设置。"
                         }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(
+                            "申请：GitHub → Settings → Developer settings → Personal access tokens。\
+                             两种类型都能用，而且都不用勾权限：classic 不勾 scope 时只能读公开信息，\
+                             fine-grained 的公开仓库只读则是令牌自带的。",
+                        ),
                 ),
         );
 
-        let data_panel = panel(
+        // 数据位置：路径是要能抄走的（备份、排查都要它），改位置的入口也在这儿。
+        let mut data_panel = panel(
             radius,
             border,
             v_flex()
                 .gap_2()
                 .child(heading(
-                    "数据",
-                    "仓库、发现源与这里的配置都在这一个 JSON 文件里。",
+                    "数据位置",
+                    "仓库、分类、标签、发现地址和这里的配置都在一个 SQLite 库里。\
+                     默认放在系统给应用数据留的位置（Windows 上是 C 盘的用户目录），可以搬到别的盘。",
                     muted,
                 ))
                 .child(
                     v_flex()
                         .gap_1()
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("{repo_count} 个仓库 · {source_count} 个发现地址")),
+                            div().text_xs().text_color(muted).child(format!(
+                                "{repo_count} 个仓库 · {source_count} 个发现地址"
+                            )),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(muted)
                                 .truncate()
-                                .child(format!("数据库：{path}")),
+                                .child(copyable(format!("数据库：{path}"))),
                         ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("choose-data-dir")
+                                .icon(IconName::FolderOpen)
+                                .label("更改位置")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.pick_directory(window, cx);
+                                })),
+                        )
+                        .child({
+                            let dir = data_dir.clone();
+                            Button::new("reveal-data-dir")
+                                .icon(IconName::Folder)
+                                .label("打开所在文件夹")
+                                .ghost()
+                                .on_click(move |_, _, cx| cx.reveal_path(&dir))
+                        }),
                 ),
         );
+
+        // 新位置已经有数据：摆出三种处理办法，各自带一句后果说明。
+        if let Some(target) = self.pending_target.clone() {
+            data_panel = data_panel.child(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(warning)
+                    .child(
+                        div().text_sm().child(format!(
+                            "{} 里已经有一份数据了，要怎么处理？",
+                            target.display()
+                        )),
+                    )
+                    .children(MoveStrategy::ALL.into_iter().map(|strategy| {
+                        let target = target.clone();
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                Button::new(match strategy {
+                                    MoveStrategy::UseNewOnly => "relocate-use-new",
+                                    MoveStrategy::Overwrite => "relocate-overwrite",
+                                    MoveStrategy::Merge => "relocate-merge",
+                                })
+                                .label(strategy.label())
+                                .outline()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.relocate(target.clone(), strategy, window, cx);
+                                })),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(strategy.hint().to_string()),
+                            )
+                            .into_any_element()
+                    }))
+                    .child(
+                        Button::new("cancel-relocate")
+                            .label("取消")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pending_target = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
 
         v_flex()
             .size_full()

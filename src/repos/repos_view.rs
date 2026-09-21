@@ -26,6 +26,7 @@ use crate::repos::model::{CategoryFilter, RepoPage};
 use crate::repos::taxonomy_dialog;
 use crate::repos::RepoId;
 use crate::shared::clock::{format_local_date, format_local_minute, format_relative, now_unix};
+use crate::shared::text::{copyable, copyable_as};
 use crate::taxonomy::chip;
 use crate::taxonomy::model as tax;
 
@@ -567,8 +568,10 @@ impl ReposView {
                     }),
             )
             .child(match detail.description_zh.as_deref() {
-                Some(text) if !text.trim().is_empty() => div().child(text.to_string()),
-                _ => div().text_color(muted).child("还没写。写一句自己的话，之后列表里就显示它。"),
+                Some(text) if !text.trim().is_empty() => div().child(copyable(text.to_string())),
+                _ => div()
+                    .text_color(muted)
+                    .child("还没写。写一句自己的话，之后列表里就显示它。"),
             })
             .child(
                 v_flex()
@@ -581,7 +584,9 @@ impl ReposView {
                             .child("原始描述（GitHub About）"),
                     )
                     .child(match detail.description.as_deref() {
-                        Some(text) if !text.trim().is_empty() => div().child(text.to_string()),
+                        Some(text) if !text.trim().is_empty() => {
+                            div().child(copyable(text.to_string()))
+                        }
                         _ => div()
                             .text_color(muted)
                             .child("尚未取到，点上面的「补全」按钮抓一次"),
@@ -591,13 +596,16 @@ impl ReposView {
         // 分类与标签：一个仓库最多属于一个分类、可以挂多个标签，所以分类画一个
         // 色块，标签横着铺一排。分类没有色块可画时就明说「未分类」。
         let category_content = match detail.category.as_deref() {
-            Some(name) => chip::category_tag(name, dark).into_any_element(),
+            Some(name) => chip::category_tag(format!("detail-category:{}", detail.id), name, dark)
+                .into_any_element(),
             None => div().text_color(muted).child("未分类").into_any_element(),
         };
         let tag_chips: Vec<AnyElement> = detail
             .tags
             .iter()
-            .map(|tag| chip::tag_tag(tag).into_any_element())
+            .map(|tag| {
+                chip::tag_tag(format!("detail-tag:{}:{tag}", detail.id), tag).into_any_element()
+            })
             .collect();
         let tag_content = if tag_chips.is_empty() {
             div().text_color(muted).child("没有标签").into_any_element()
@@ -672,7 +680,10 @@ impl ReposView {
                                 div()
                                     .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(detail.full_name.clone()),
+                                    .child(copyable_as(
+                                        format!("detail-name:{}", detail.id),
+                                        detail.full_name.clone(),
+                                    )),
                             )
                             .when(detail.pending, |this| {
                                 this.child(Tag::warning().small().child("待补全").into_any_element())

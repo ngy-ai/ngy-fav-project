@@ -4,9 +4,11 @@
 //! 实体，后台抓取回到主线程之后才落库，所以不需要连接池，也不存在跨线程问题。
 //!
 //! 分成几块：`schema` 管表结构与版本迁移，`repos` / `taxonomy` / `sources`
-//! 各自管一组表的读写，`legacy` 负责把旧版 `library.json` 导进来。
+//! 各自管一组表的读写，`legacy` 负责把旧版 `library.json` 导进来，`merge`
+//! 负责把另一个库并进来。
 
 pub mod legacy;
+pub mod merge;
 pub mod repos;
 pub mod schema;
 pub mod sources;

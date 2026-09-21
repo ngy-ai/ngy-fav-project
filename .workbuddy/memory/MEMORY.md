@@ -40,6 +40,30 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
 - 旧 `library.json` **只在全新空库时导入一次**，成功后 `archive_file` 改名留档。
   库里有数据就完全不碰它。
 
+## 数据位置与搬迁（`shared/store.rs` / `relocate.rs` / `db/merge.rs`）
+
+- **位置分两层，这是数据能搬走的前提**：`store::config_dir()`（固定不动，
+  `%APPDATA%\ngy-fav-project`，里面只有几字节的 `location.json`）与**数据目录**
+  （默认就是配置目录本身）。`store::data_dir()` 现在要读 `location.json`——
+  它已经不是原来那个「数据目录」了，加代码前先看清用的是哪一个。
+- **`location.json` 同时存 `data_dir` 与 `pending_move: {from, strategy}`**。
+  搬家的顺序固定：**先记意图 → 再动文件 → 最后改路径**。`Library::load` 一进来先
+  看有没有 `pending_move`，有就补做完再打开库；补不动就退回老位置、把标记留着下次再试。
+- **`Library::relocate` 是搬数据的唯一入口**（先写 location → 按策略处理目标位置
+  → 关连接 → 搬文件 → `open_at` 新位置 → 清 `pending_move`）。中间任何一步失败都
+  `roll_back` 回原位置，绝不留下「指向空目录」的配置。
+- **`MoveStrategy` 只有三种**（`UseNewOnly` / `Overwrite` / `Merge`），都是「两边都不会
+  同时弄丢」的方案。界面上按 `ALL` 的顺序摆，附带 `label()` / `hint()`。
+- **合并时新位置是主人**：仓库按 `full_name`（小写后）判重、同名保留新位置那份；
+  分类**按路径**合并（两个库的自增 id 之间没关系）；标签按名字忽略大小写；发现源按 URL；
+  **设置不动**。实现是「源库读成 Rust 值 → 目标库开事务逐条 `INSERT OR IGNORE`」，
+  因为 `ATTACH` 不能跨连接共享而本程序是单连接模型。
+- **用另一个库覆盖目标之前必须 `store::discard_sidecars(target)`**：留着别人的
+  `-wal` / `-shm`，下次打开会拿配不上的 WAL 恢复，那是真会毁数据的。
+- **`store::data_files` 只认 `library.` 开头**且只含字母数字与 `.` `-` `_` 的名字。
+  别放宽成 `library` 开头，`library2.db` 会被误搬。
+- 合并/覆盖的判断要在 `self.db = None` **之前**做——合并读的就是 `self.db`。
+
 ## 分类与标签（`src/taxonomy/`）
 
 - **分类是 `parent_id` 真树**（`CategoryTree`），仓库上是 `Repo.category_id: Option<i64>`；
@@ -95,6 +119,21 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
   `entity.update(cx, |this, cx| this.commit(cx))`。
   另外 `cx.theme()` 借的是 `&cx`，要在造回调之前把颜色抄成值（`Hsla` 是 Copy）。
 
+## 文本可选中（`src/shared/text.rs`）
+
+- 选中与剪贴板是 **gpui-base 的窗口级能力**（`SelectableText` + `Root::render` 里那层
+  `TextSelectionLayer`），不要自己写。项目只在 `text.rs` 里包了 `copyable`（id 取代码位置）
+  与 `copyable_as`（显式 id）两个入口。
+- **`SelectableText` 不实现 `Styled`**：`.text_color()` / `.text_sm()` / `.truncate()` 一律没有，
+  样式靠外层 `div` 继承（它的 `request_layout` 用 `window.text_style()`）。写法是
+  `div().text_xs().text_color(muted).child(copyable(...))`。
+- **循环、列表行、同一视图的多份实例必须用 `copyable_as`**。`ListItem::new(id)` 内部只是
+  `h_flex().id(id)`，**不往元素 id 栈里压**，所以同一 `render_item` 里多处 `copyable` 的
+  全局 id 完全一样，第 2 行起会共用第 1 行的选中状态。id 里带上业务主键
+  （`repo-category:{id}` / `source-url:{url}` / `assign-note:{kind.label()}`）。
+- **按钮标签、页面标题不做**：`SelectableText` 会插一层 hitbox，摆在按钮里会把点击抢走。
+  判断标准是「这句话是内容，还是控件本身」。
+
 ## 后台调度（`src/discovery/runner.rs`）
 
 - 巡检每 5 秒一次，判断交给纯函数 `decide(TickState, now)`，触发条件有测试兜着。
@@ -131,6 +170,16 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
 - **界面截不到图**（`Screenshot` 只看得到宿主桌面，画布不在上面）。但 windows-mcp 的
   `Process` 能列出沙箱里这个应用进程、`App`（按窗口标题 switch/resize）也认得到窗口，
   所以「进程起没起来、有没有 panic、数据文件有没有被改写」都能查。
+- **沙箱里的 cargo 可能卡在文件锁上**，别干等：输出 `Blocking waiting for file lock on
+  package cache`、rustc 起来后 CPU 增量恒为 0（10 秒 +0.0s）、20 分钟不出结果——那是等锁，
+  不是慢（宿主上 rustc 编个最小程序只要 0.5 秒）。本机有别的 cargo 在反复抢锁
+  （IDE 的测试运行器会起 `cargo test --lib --locked <name>:: --no-fail-fast`）。
+  用 `Get-CimInstance Win32_Process -Filter "Name='cargo.exe'"` 看是谁，清掉卡住的进程后
+  **改用宿主 PowerShell 跑 `cargo build/test`**：干净环境下增量 3.5 秒，全套几分钟。
+  另外后台任务的 `/tmp` 与当前 shell 的 `/tmp` 可能不同，日志写到 `target/` 里才读得到。
+- **`Button` 的外观方法（`ghost`/`primary`/`danger`…）来自 `ButtonVariants` trait**，
+  每个文件都要 `button::{Button, ButtonVariants as _}`。漏了就是 E0599 `no method named`。
+  遇到这种错，先看**能编译的文件**里同一个方法是怎么导入的。
 - 造临时数据用 `NGY_FAV_HOME` 指到临时目录，别碰 `%APPDATA%` 里的真实数据。
 - 后台跑 GUI 应用要用 `run_in_background`，普通 `&` 会随 shell 退出被杀。
 - **跑完一定要杀进程**（windows-mcp `Process` mode=kill）。残留进程占着

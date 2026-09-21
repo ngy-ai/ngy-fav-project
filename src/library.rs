@@ -22,6 +22,7 @@ use crate::discovery::model::{
 use crate::repos::model::{
     CategoryFilter, CategoryScope, Repo, RepoId, RepoPage, RepoQuery, RepoQuerySpec, RepoRow,
 };
+use crate::shared::relocate::{self, MoveStrategy};
 use crate::shared::store;
 use crate::taxonomy::model::{self as tax, AddName, RenameName, Tag, TaxonomyKind};
 use crate::taxonomy::tree::{CategoryTree, FlatCategory};
@@ -75,7 +76,14 @@ pub struct Library {
     /// 数据库连接。打不开时为 `None`：应用还能起来看，但任何改动都会如实报失败，
     /// 而不是假装写进去了。
     db: Option<Db>,
+    /// 当前库文件的位置。换了数据位置之后它跟着变。
     path: PathBuf,
+    /// 记录「数据放在哪」的那个配置文件。
+    ///
+    /// 只有从默认位置启动（[`Library::load`]）时才有。`load_from` 的语义是
+    /// 「按我给的这个路径打开」，位置由调用方说了算，也不该往用户的真实配置
+    /// 目录里写东西。
+    location_file: Option<PathBuf>,
     /// 启动时遇到的问题，在界面上如实展示。
     load_warning: Option<String>,
     /// 启动时想告诉用户的事（例如「已经帮你把旧数据迁过来了」）。
@@ -84,9 +92,47 @@ pub struct Library {
 }
 
 impl Library {
-    /// 从默认位置加载。
+    /// 从配置指定的位置加载，顺带把上次没做完的搬家接着做完。
     pub fn load() -> Self {
-        Self::load_from(store::default_db_path())
+        let config = store::config_dir();
+        let mut location = store::read_location();
+        let mut dir = store::data_dir_from(&config, &location);
+        let mut startup_note = None;
+        let mut startup_warning = None;
+
+        if let Some(pending) = location.pending_move.clone() {
+            match finish_move(&dir, &pending) {
+                Ok(note) => {
+                    // 做完了就把标记清掉。清不掉也不要紧：下次启动会发现没有可搬
+                    // 的东西，照样把这个标记收干净。
+                    location.pending_move = None;
+                    if let Err(error) = store::write_location(&location) {
+                        startup_warning = Some(format!(
+                            "位置已经换好了，但没能把新位置记下来（{error}）。\
+                             下次启动会再走一遍同样的流程，结果是一样的。"
+                        ));
+                    }
+                    startup_note = note;
+                }
+                Err(error) => {
+                    // 数据还在老地方。这一次先用老位置把程序跑起来，标记留着，
+                    // 下次启动再试——文件被占住这类问题，重启一次多半就没了。
+                    dir = pending.from.clone();
+                    startup_warning =
+                        Some(format!("{error}。这一次先用原来的位置；下次启动会自动再试。"));
+                }
+            }
+        }
+
+        let mut library = Self::load_from(store::db_path(&dir));
+        library.location_file = Some(store::location_path());
+        if library.load_note.is_none() {
+            library.load_note = startup_note;
+        }
+        if let Some(warning) = startup_warning {
+            library.push_warning(warning);
+        }
+        library
     }
 
     /// 从指定的数据库文件加载。旧版 `library.json` 按同目录同名去找。
@@ -100,6 +146,7 @@ impl Library {
             settings: DiscoverySettings::default(),
             db: None,
             path,
+            location_file: None,
             load_warning: None,
             load_note: None,
             save_state: SaveState::Untouched,
@@ -136,11 +183,7 @@ impl Library {
     /// 全新的库：要么导入旧版 JSON，要么给一个默认发现源。
     fn seed_empty_database(&mut self, db: &Db, legacy_path: &Path) {
         if !legacy_path.exists() {
-            for source in default_sources() {
-                if let Err(error) = db::sources::insert_source(db.conn(), &source) {
-                    self.push_warning(format!("写入默认发现源失败：{error}"));
-                }
-            }
+            self.seed_default_sources(db);
             return;
         }
 
@@ -181,6 +224,187 @@ impl Library {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 库文件所在的目录，也就是「数据放在哪」这个问题的答案。
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// 这个目录里是不是已经有数据了。
+    ///
+    /// 换位置之前先问一句：那边已经有数据时该怎么办得由用户挑，不能由我们替他
+    /// 决定是盖掉还是并起来。
+    pub fn target_has_data(dir: &Path) -> bool {
+        store::has_database(dir)
+    }
+
+    /// 换数据位置。
+    ///
+    /// 顺序是刻意排的：**先记下意图，再动文件，最后才改路径**。中间任何一步断掉，
+    /// 下次启动都能照着记下来的东西接着做完（见 [`Library::load`]）。
+    ///
+    /// 能当场做完就不要求用户重启：连接是自己关的，文件也是自己搬的。真搬不动
+    /// （文件被别的进程占着之类）才回退到原位置，并把「下次启动再试」留在配置里。
+    pub fn relocate(&mut self, target: &Path, strategy: MoveStrategy) -> Result<Relocation, String> {
+        let previous_dir = self.dir().to_path_buf();
+        let target = absolute(target);
+        if target == previous_dir {
+            return Err("新的位置和现在一样，什么都没做".to_string());
+        }
+
+        // 先把「打算搬到哪、怎么搬」写进配置：之后无论哪一步失败，下次启动都
+        // 能照着它补完。
+        self.remember(store::Location {
+            data_dir: Some(target.clone()),
+            pending_move: Some(store::PendingMove {
+                from: previous_dir.clone(),
+                strategy,
+            }),
+        })?;
+
+        // 合并趁两个连接都还开着的时候做。这一步只跟数据库打交道，不碰文件，
+        // 失败也不会留下半个状态。
+        let mut merged = None;
+        match strategy {
+            MoveStrategy::UseNewOnly => {}
+            MoveStrategy::Overwrite => {
+                if let Err(error) = store::discard_sidecars(&target) {
+                    let reason = format!("清理那边的临时文件失败：{error}");
+                    return Err(self.roll_back(&previous_dir, reason));
+                }
+            }
+            MoveStrategy::Merge if store::has_database(&target) => {
+                match self.merge_into_target(&target) {
+                    Ok(report) => merged = Some(report),
+                    Err(reason) => return Err(self.roll_back(&previous_dir, reason)),
+                }
+            }
+            MoveStrategy::Merge => {}
+        }
+
+        // 接下来要动文件，连接必须先关掉——Windows 上它占着库文件。
+        self.db = None;
+
+        let files = store::data_files(&previous_dir);
+        let moved = match strategy {
+            MoveStrategy::UseNewOnly => relocate::MoveReport::default(),
+            // 合并已经把数据放进新库了，旧文件这时只是残渣，删掉才算真的搬走了。
+            MoveStrategy::Merge if merged.is_some() => match relocate::remove_files(&files) {
+                Ok(gone) => relocate::MoveReport {
+                    moved: gone,
+                    ..Default::default()
+                },
+                Err(error) => {
+                    return Err(self.roll_back(&previous_dir, format!("清理旧文件失败：{error}")));
+                }
+            },
+            _ => match relocate::move_files(&files, &target, true) {
+                Ok(report) => report,
+                Err(error) => {
+                    return Err(self.roll_back(&previous_dir, format!("搬文件失败：{error}")));
+                }
+            },
+        };
+
+        // 数据已经在新位置了。从这里开始失败都不能回退，只能如实说明。
+        if let Err(error) = self.open_at(&target) {
+            self.save_state = SaveState::Failed(error.clone());
+            return Err(format!(
+                "数据已经搬到 {}，但没能打开它（{error}）。请重启程序，或在设置里重新选一次位置。",
+                target.display()
+            ));
+        }
+        // 搬完了就把待办标记清掉。清不掉也不要紧：下次启动会发现没有可搬的东西。
+        if let Err(error) = self.remember(store::Location {
+            data_dir: Some(target.clone()),
+            pending_move: None,
+        }) {
+            self.push_warning(format!("数据已经搬到新位置，但没能把这个位置记下来（{error}）"));
+        }
+
+        Ok(Relocation {
+            path: self.path.clone(),
+            previous_dir,
+            strategy,
+            moved: moved.moved.len(),
+            left_behind: moved.left_behind.len(),
+            merged,
+        })
+    }
+
+    /// 把当前库并进目标位置的库。两个连接都开着，读一个、写一个。
+    fn merge_into_target(&self, target: &Path) -> Result<db::merge::MergeReport, String> {
+        let source = self.db.as_ref().ok_or("当前数据库没有打开，没法合并")?;
+        let target_db = store::db_path(target);
+        let destination =
+            Db::open(&target_db).map_err(|error| format!("打开 {} 失败：{error}", target_db.display()))?;
+        let report = db::merge::merge_into(&destination, source)
+            .map_err(|error| format!("合并数据失败：{error}"))?;
+        // 目标连接要在这里放开：下面还要往那个目录里搬文件。
+        drop(destination);
+        Ok(report)
+    }
+
+    /// 搬家失败之后收拾局面：把连接开回原来的位置，并给出给用户看的那句话。
+    ///
+    /// 配置里那个待办标记**故意留着**，下次启动会照着它再试一遍。
+    fn roll_back(&mut self, previous_dir: &Path, reason: String) -> String {
+        match self.open_at(previous_dir) {
+            Ok(()) => format!(
+                "没能搬过去（{reason}）。数据还在 {}，这一次继续用它；\
+                 下次启动会自动再试一次，也可以在设置里重新选一个位置。",
+                previous_dir.display()
+            ),
+            Err(error) => format!(
+                "没能搬过去（{reason}），连原来的位置也打不开了（{error}）。\
+                 请重启程序；数据文件仍在 {}。",
+                previous_dir.display()
+            ),
+        }
+    }
+
+    /// 在某个目录上打开库，并把内存镜像换成那儿读到的内容。
+    ///
+    /// 只用于换位置。失败时把库留成「没有连接」的状态：宁可什么都改不了，
+    /// 也不要让人以为改动写进去了。
+    fn open_at(&mut self, dir: &Path) -> Result<(), String> {
+        self.db = None;
+        let path = store::db_path(dir);
+        let db = Db::open(&path).map_err(|error| format!("打开 {} 失败：{error}", path.display()))?;
+
+        match db::sources::is_empty(db.conn()) {
+            Ok(true) => self.seed_default_sources(&db),
+            Ok(false) => {}
+            Err(error) => return Err(format!("读取数据失败：{error}")),
+        }
+        match read_snapshot(&db) {
+            Ok(snapshot) => self.apply(snapshot),
+            Err(error) => return Err(format!("读取数据失败：{error}")),
+        }
+
+        self.path = path;
+        self.db = Some(db);
+        Ok(())
+    }
+
+    /// 一个全新的空库：给它一套默认发现源，别让「发现」页空着。
+    fn seed_default_sources(&mut self, db: &Db) {
+        for source in default_sources() {
+            if let Err(error) = db::sources::insert_source(db.conn(), &source) {
+                self.push_warning(format!("写入默认发现源失败：{error}"));
+            }
+        }
+    }
+
+    /// 把位置配置写下来。没有记录点时什么都不做（`load_from` 打开的库就是这种，
+    /// 它的位置由调用方说了算）。
+    fn remember(&self, location: store::Location) -> Result<(), String> {
+        let Some(path) = self.location_file.as_ref() else {
+            return Ok(());
+        };
+        store::write_location_to(path, &location)
+            .map_err(|error| format!("写入 {} 失败：{error}", path.display()))
     }
 
     pub fn load_warning(&self) -> Option<&str> {
@@ -956,6 +1180,149 @@ impl Library {
     }
 }
 
+/// 换完位置之后的账。用来给用户一句准话：搬到哪了、搬了多少、旧的呢。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relocation {
+    /// 新的库文件。
+    pub path: PathBuf,
+    /// 原来的目录。
+    pub previous_dir: PathBuf,
+    pub strategy: MoveStrategy,
+    /// 搬走或清掉的库文件数（WAL 之类也在里面）。
+    pub moved: usize,
+    /// 复制成功、源文件却没删掉的个数——两边都还在。
+    pub left_behind: usize,
+    /// 合并的账，只有真的合并过才有。
+    pub merged: Option<db::merge::MergeReport>,
+}
+
+impl Relocation {
+    /// 一句给用户看的话：搬完了、还是并完了、旧东西在哪。
+    pub fn note(&self) -> String {
+        let mut text = format!(
+            "数据位置已改为 {}（{}）",
+            self.path.display(),
+            self.strategy.label()
+        );
+        match &self.merged {
+            Some(merged) => text.push_str(&format!(
+                "：并进来 {} 个仓库（{} 个两边都有，留着新位置那份）、{} 个分类、{} 个标签、{} 个发现地址",
+                merged.repos, merged.repos_kept, merged.categories, merged.tags, merged.sources
+            )),
+            None if self.strategy == MoveStrategy::UseNewOnly => text.push_str(&format!(
+                "；原来的数据一点没动，还在 {}",
+                self.previous_dir.display()
+            )),
+            None => text.push_str(&format!("，搬了 {} 个文件", self.moved)),
+        }
+        if self.left_behind > 0 {
+            text.push_str(&format!(
+                "；有 {} 个旧文件没能删掉，两边都还在",
+                self.left_behind
+            ));
+        }
+        text
+    }
+}
+
+/// 把一个用户给的目录变成稳定的绝对路径：相对路径按当前目录补全，末尾多出来的
+/// 分隔符去掉——`D:\数据\` 与 `D:\数据` 是同一个地方，比较之前得先收干净。
+fn absolute(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+
+    let mut text = joined.to_string_lossy().to_string();
+    // 只剩盘符（`D:\`）或根（`/`）时就别再削了。
+    while text.len() > 3 && (text.ends_with('\\') || text.ends_with('/')) {
+        text.pop();
+    }
+    PathBuf::from(text)
+}
+
+/// 补做一次没做完的搬家。启动时调用。
+///
+/// 运行时的 [`Library::relocate`] 之所以会留下待办标记，多半是文件被占着搬不动；
+/// 下一次启动时没有连接占着它们，同样的动作就能做成。所以这里不另写一套逻辑——
+/// **照着当初选的策略再做一遍**，而不是重新猜用户想要什么。
+fn finish_move(target: &Path, pending: &store::PendingMove) -> Result<Option<String>, String> {
+    let files = store::data_files(&pending.from);
+    if files.is_empty() {
+        // 上次其实已经搬完了，只是没来得及把标记清掉。
+        return Ok(None);
+    }
+    if pending.strategy == MoveStrategy::UseNewOnly {
+        // 当初选的就是不动旧文件，那就真的不动。
+        return Ok(Some(format!(
+            "数据位置已改为 {}；原来的数据仍在 {}，可以自己删。",
+            target.display(),
+            pending.from.display()
+        )));
+    }
+
+    let source_db = store::db_path(&pending.from);
+    let target_db = store::db_path(target);
+    let mut merged = None;
+    match pending.strategy {
+        MoveStrategy::Overwrite => {
+            store::discard_sidecars(target).map_err(|error| {
+                format!("清理 {} 里的临时文件失败：{error}", target.display())
+            })?;
+        }
+        MoveStrategy::Merge if target_db.is_file() => {
+            let source = Db::open(&source_db)
+                .map_err(|error| format!("打开 {} 失败：{error}", source_db.display()))?;
+            let destination = Db::open(&target_db)
+                .map_err(|error| format!("打开 {} 失败：{error}", target_db.display()))?;
+            let report = db::merge::merge_into(&destination, &source)
+                .map_err(|error| format!("合并数据失败：{error}"))?;
+            // 两个连接都得放开，下面才动得了这两个目录里的文件。
+            drop(destination);
+            drop(source);
+            merged = Some(report);
+        }
+        _ => {}
+    }
+
+    let mut note = format!("上次没做完的搬家已经补上：数据现在在 {}", target.display());
+    if pending.strategy == MoveStrategy::Merge && merged.is_some() {
+        // 数据已经并进新库了，旧文件此刻只是残渣，删掉才算真的搬走了。
+        let gone = relocate::remove_files(&files)
+            .map_err(|error| format!("清理旧文件失败：{error}"))?;
+        if let Some(merged) = &merged {
+            note.push_str(&format!(
+                "；并进来 {} 个仓库、{} 个分类、{} 个标签、{} 个发现地址，清掉 {} 个旧文件",
+                merged.repos,
+                merged.categories,
+                merged.tags,
+                merged.sources,
+                gone.len()
+            ));
+        }
+    } else {
+        let report = relocate::move_files(&files, target, true).map_err(|error| {
+            format!(
+                "从 {} 搬到 {} 失败：{error}",
+                pending.from.display(),
+                target.display()
+            )
+        })?;
+        note.push_str(&format!("，一共 {} 个文件", report.moved.len()));
+        if !report.left_behind.is_empty() {
+            note.push_str(&format!(
+                "；有 {} 个旧文件没能删掉，两边都还在",
+                report.left_behind.len()
+            ));
+        }
+    }
+
+    Ok(Some(note))
+}
+
 fn read_snapshot(db: &Db) -> db::DbResult<Snapshot> {
     let conn = db.conn();
     Ok(Snapshot {
@@ -982,15 +1349,22 @@ mod tests {
 
     /// 每次调用都新建一个目录：固定目录名会让「第二次跑测试」读到上一次写下的数据，
     /// 于是断言开始飘。
+    ///
+    /// 名字里带一个自增序号：只靠时间戳不够——系统时钟的粒度可能比两次调用之间的
+    /// 间隔还大，紧挨着要几个目录时会拿到同一个时间戳。
     fn unique_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default();
         let dir = std::env::temp_dir().join(format!(
-            "ngy-fav-library-test-{name}-{}-{stamp}",
-            std::process::id()
+            "ngy-fav-library-test-{name}-{}-{stamp}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1790,5 +2164,201 @@ mod tests {
     fn database_errors_have_a_readable_message() {
         let error = DbError::Format("文件读不懂".to_string());
         assert_eq!(error.message(), "文件读不懂");
+    }
+
+    // ---- 换数据位置 ----
+
+    /// 目标是个空目录：搬过去，当场就能继续用，不要求重启。
+    #[test]
+    fn moving_the_data_takes_effect_right_away() {
+        let source_dir = unique_dir("move-source");
+        let target_dir = unique_dir("move-target");
+        let mut library = Library::load_from(source_dir.join("library.db"));
+        library.add_repo(Repo::new("a/one".to_string(), None, 1));
+        library.add_name(TaxonomyKind::Category, "工具");
+
+        let report = library
+            .relocate(&target_dir, MoveStrategy::Overwrite)
+            .expect("空目标不该搬不动");
+
+        assert_eq!(report.path, target_dir.join("library.db"));
+        assert_eq!(library.path(), target_dir.join("library.db"));
+        assert!(library.repo("a/one").is_some(), "内存里的数据还在，只是换了地方");
+        assert_eq!(library.names(TaxonomyKind::Category), ["工具".to_string()]);
+        assert!(!source_dir.join("library.db").exists(), "旧位置的文件要搬走");
+        assert!(target_dir.join("library.db").is_file());
+
+        // 真的落在那儿了：另开一份也读得到。
+        let reloaded = Library::load_from(target_dir.join("library.db"));
+        assert_eq!(reloaded.repo_count(), 1);
+    }
+
+    /// 目标已经有库时，三种策略各自的结果。
+    #[test]
+    fn both_places_have_data_and_the_user_decides_what_happens() {
+        for (strategy, keeps_old, keeps_new, source_survives) in [
+            (MoveStrategy::UseNewOnly, false, true, true),
+            (MoveStrategy::Overwrite, true, false, false),
+            (MoveStrategy::Merge, true, true, false),
+        ] {
+            let source_dir = unique_dir("both-source");
+            let target_dir = unique_dir("both-target");
+
+            let mut library = Library::load_from(source_dir.join("library.db"));
+            library.add_repo(Repo::new("a/one".to_string(), None, 1));
+            {
+                let mut other = Library::load_from(target_dir.join("library.db"));
+                other.add_repo(Repo::new("b/two".to_string(), None, 2));
+            }
+
+            let report = library.relocate(&target_dir, strategy).expect("应当能搬");
+
+            assert_eq!(
+                library.repo("a/one").is_some(),
+                keeps_old,
+                "{strategy:?}：旧数据该留住吗"
+            );
+            assert_eq!(
+                library.repo("b/two").is_some(),
+                keeps_new,
+                "{strategy:?}：新位置那份该留住吗"
+            );
+            assert_eq!(
+                source_dir.join("library.db").exists(),
+                source_survives,
+                "{strategy:?}：旧文件该不该原地留着"
+            );
+            assert!(target_dir.join("library.db").is_file());
+
+            // 换完位置的库必须真的能用，重启之后也一样。
+            let reloaded = Library::load_from(target_dir.join("library.db"));
+            assert_eq!(
+                reloaded.repo_count(),
+                library.repo_count(),
+                "{strategy:?}：换完之后重新打开，读到的仓库数应当一样多\
+                 （内存 {} 个，文件 {} 个；目标 {}）",
+                library.repo_count(),
+                reloaded.repo_count(),
+                target_dir.display()
+            );
+
+            if strategy == MoveStrategy::Merge {
+                let merged = report.merged.expect("合并要报账");
+                assert_eq!(merged.repos, 1, "旧位置那个仓库要并进来");
+                assert_eq!(merged.repos_kept, 0, "两边没有同名仓库，一条都不用让位");
+            } else {
+                assert_eq!(report.merged, None);
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_place_is_refused() {
+        let dir = unique_dir("same-place");
+        let mut library = Library::load_from(dir.join("library.db"));
+        let error = library
+            .relocate(&dir, MoveStrategy::Overwrite)
+            .expect_err("搬到原地应该被拒绝");
+        assert!(error.contains("一样"), "得到：{error}");
+    }
+
+    /// 搬不动的时候不能装作搬好了：数据、内存、连接都得留在原处。
+    #[test]
+    fn a_failed_move_leaves_the_library_usable_where_it_was() {
+        let source_dir = unique_dir("fail-source");
+        // 目标位置上先放一个**文件**：目录建不出来，搬家中途必然失败。
+        let blocker = unique_dir("fail-target").join("这里是个文件");
+        std::fs::write(&blocker, "x").unwrap();
+
+        let mut library = Library::load_from(source_dir.join("library.db"));
+        library.add_repo(Repo::new("a/one".to_string(), None, 1));
+
+        let error = library
+            .relocate(&blocker, MoveStrategy::Overwrite)
+            .expect_err("建不出目录就该失败");
+        assert!(error.contains("下次启动"), "要说清接下来怎么办：{error}");
+
+        assert_eq!(library.repo_count(), 1, "回滚之后原来那份还能用");
+        assert_eq!(library.path(), source_dir.join("library.db"));
+        assert!(source_dir.join("library.db").is_file());
+        // 回滚之后仍然写得动——不能只剩一个读得到、改不了的空壳。
+        assert!(library.set_description_zh("a/one", Some("还能写".to_string())));
+        assert_eq!(
+            Library::load_from(source_dir.join("library.db"))
+                .repo("a/one")
+                .unwrap()
+                .description_zh
+                .as_deref(),
+            Some("还能写")
+        );
+    }
+
+    // ---- 启动时补做没做完的搬家 ----
+
+    #[test]
+    fn a_pending_move_is_carried_out_on_the_next_start() {
+        let from = unique_dir("pending-from");
+        let to = unique_dir("pending-to");
+        {
+            let mut library = Library::load_from(from.join("library.db"));
+            library.add_repo(Repo::new("a/one".to_string(), None, 1));
+        }
+
+        let pending = store::PendingMove {
+            from: from.clone(),
+            strategy: MoveStrategy::Overwrite,
+        };
+        let note = finish_move(&to, &pending)
+            .expect("应当能补做")
+            .expect("应当给出说明");
+        assert!(note.contains("补上"), "得到：{note}");
+        assert!(to.join("library.db").is_file());
+        assert!(!from.join("library.db").exists(), "补做也是搬走，不是复制");
+
+        assert_eq!(Library::load_from(to.join("library.db")).repo_count(), 1);
+    }
+
+    #[test]
+    fn a_pending_merge_brings_both_sides_together() {
+        let from = unique_dir("pending-merge-from");
+        let to = unique_dir("pending-merge-to");
+        {
+            let mut library = Library::load_from(from.join("library.db"));
+            library.add_repo(Repo::new("a/one".to_string(), None, 1));
+        }
+        {
+            let mut library = Library::load_from(to.join("library.db"));
+            library.add_repo(Repo::new("b/two".to_string(), None, 2));
+        }
+
+        let pending = store::PendingMove {
+            from: from.clone(),
+            strategy: MoveStrategy::Merge,
+        };
+        let note = finish_move(&to, &pending).unwrap().expect("应当给出说明");
+        assert!(note.contains("并进来"), "得到：{note}");
+
+        let reloaded = Library::load_from(to.join("library.db"));
+        assert_eq!(reloaded.repo_count(), 2, "两边都要在");
+        assert!(!from.join("library.db").exists());
+    }
+
+    /// 上次其实已经搬完了，只是标记没来得及清掉——不能再搬一次。
+    #[test]
+    fn a_pending_move_with_nothing_left_to_move_is_a_no_op() {
+        let from = unique_dir("pending-empty-from");
+        let to = unique_dir("pending-empty-to");
+
+        for strategy in [
+            MoveStrategy::UseNewOnly,
+            MoveStrategy::Overwrite,
+            MoveStrategy::Merge,
+        ] {
+            let pending = store::PendingMove {
+                from: from.clone(),
+                strategy,
+            };
+            assert_eq!(finish_move(&to, &pending).unwrap(), None);
+        }
     }
 }

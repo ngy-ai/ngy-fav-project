@@ -18,6 +18,7 @@ use crate::discovery::runner::DiscoveryRunner;
 use crate::library::{AddOutcome, Library};
 use crate::repos::model::{Repo, parse_full_name};
 use crate::shared::clock::now_unix;
+use crate::shared::text::copyable;
 
 pub fn open(
     input: &Entity<InputState>,
@@ -44,7 +45,7 @@ pub fn open(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("支持 owner/repo、https://github.com/owner/repo 两种写法"),
+                    .child(copyable("支持 owner/repo、https://github.com/owner/repo 两种写法")),
             )
             .footer(
                 DialogFooter::new()
