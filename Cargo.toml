@@ -1,0 +1,34 @@
+[package]
+name = "ngy-fav-project"
+version = "0.1.0"
+edition = "2024"
+description = "GitHub 仓库管理与发现工具"
+
+[dependencies]
+gpui-kit = "0.6.4"
+anyhow = "1"
+chrono = "0.4"
+futures = "0.3"
+scraper = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+
+# 只为了把 assets/icon.ico 嵌进 exe，非 Windows 平台不需要。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.dev]
+# GPUI 的布局 / 文本 / 渲染代码在未优化时慢到不可用，只对这几层开优化。
+debug = "limited"
+
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-wgpu = { opt-level = 3 }
+gpui-pre-sum-tree = { opt-level = 3 }
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }

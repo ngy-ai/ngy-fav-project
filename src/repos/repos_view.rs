@@ -1,0 +1,761 @@
+//! 仓库页：左侧列表 + 右侧详情。
+//!
+//! 选中状态只有一份，放在列表的 delegate 里（它无论如何都要知道谁被选中才能
+//! 画出高亮），本视图通过观察列表把它镜像出来给详情面板用。
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+    button::{Button, ButtonVariants as _},
+    description_list::DescriptionList,
+    dialog::{DialogAction, DialogClose, DialogFooter},
+    input::{InputEvent, InputState},
+    list::{List, ListState},
+    notification::Notification,
+    tag::Tag,
+};
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+
+use crate::discovery::DiscoveryRunner;
+use crate::library::Library;
+use crate::repos::add_repo_dialog;
+use crate::repos::edit_description_dialog;
+use crate::repos::list_delegate::{CategoryFilter, RepoListDelegate, RepoRow};
+use crate::repos::taxonomy_dialog;
+use crate::repos::RepoId;
+use crate::shared::clock::{format_local_date, format_local_minute, format_relative, now_unix};
+use crate::taxonomy::chip;
+use crate::taxonomy::model::TaxonomyKind;
+
+/// 列表栏宽度。固定宽度让详情面板有稳定的阅读宽度，也避免拖拽时重新布局。
+const LIST_WIDTH: f32 = 320.;
+
+/// 详情面板需要的一次性快照。
+///
+/// 渲染时先把要显示的东西抄成自有数据，避免在借用 `Library` 的同时还要
+/// 生成 `cx.listener(...)` 回调。
+struct RepoDetail {
+    id: RepoId,
+    full_name: String,
+    url: String,
+    description: Option<String>,
+    description_zh: Option<String>,
+    language: Option<String>,
+    stars: Option<u64>,
+    discovered_at: i64,
+    created_at: Option<i64>,
+    source: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+    pending: bool,
+}
+
+pub struct ReposView {
+    library: Entity<Library>,
+    runner: Entity<DiscoveryRunner>,
+    list: Entity<ListState<RepoListDelegate>>,
+    /// 「添加仓库」对话框的输入框。由本视图长期持有，原因见 `add_repo_dialog`。
+    input: Entity<InputState>,
+    selected: Option<RepoId>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl ReposView {
+    pub fn new(
+        library: Entity<Library>,
+        runner: Entity<DiscoveryRunner>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let list = cx.new(|cx| ListState::new(RepoListDelegate::new(), window, cx).searchable(true));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("owner/repo 或 https://github.com/owner/repo")
+                .submit_on_enter(true)
+        });
+
+        let mut subscriptions = Vec::new();
+
+        // 后台发现、元数据补全都会改 `Library`，这里是界面跟上它的唯一入口。
+        subscriptions.push(cx.observe(&library, |this, _, cx| {
+            this.sync_rows(cx);
+        }));
+
+        // 列表是选中项的所有者；视图只镜像它，不再自己维护一份可写副本。
+        subscriptions.push(cx.observe(&list, |this, list, cx| {
+            let selection = list.read(cx).delegate().selection().cloned();
+            if this.selected != selection {
+                this.selected = selection;
+                cx.notify();
+            }
+        }));
+
+        // 输入框只在对话框里被渲染，能收到回车就说明对话框正开着。
+        subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_input(window, cx);
+                }
+            },
+        ));
+
+        let mut view = Self {
+            library,
+            runner,
+            list,
+            input,
+            selected: None,
+            _subscriptions: subscriptions,
+        };
+        view.sync_rows(cx);
+        view
+    }
+
+    /// 把 `Library` 里的仓库推给列表 delegate。
+    fn sync_rows(&mut self, cx: &mut Context<Self>) {
+        let (rows, categories): (Vec<RepoRow>, Vec<String>) = {
+            let library = self.library.read(cx);
+            let rows = library
+                .repos_newest_first()
+                .into_iter()
+                .map(|repo| RepoRow {
+                    id: repo.id(),
+                    full_name: repo.full_name.clone(),
+                    subtitle: repo
+                        .display_description()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "暂无描述，等待补全".to_string()),
+                    language: repo.language.clone(),
+                    pending_metadata: repo.has_pending_metadata(),
+                    category: repo.category.clone(),
+                    tags: repo.tags.clone(),
+                })
+                .collect();
+            (rows, library.names(TaxonomyKind::Category).to_vec())
+        };
+
+        // 被移除的仓库不能继续占着选中状态，否则详情面板会指向一个不存在的东西。
+        let selected_still_present = self
+            .selected
+            .as_ref()
+            .is_some_and(|id| rows.iter().any(|row| &row.id == id));
+        if !selected_still_present {
+            self.selected = None;
+        }
+        let selected = self.selected.clone();
+
+        self.list.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            // 分类被删掉之后，原来按它筛的列表会永远空着——退回「全部」。
+            if let CategoryFilter::Named(name) = delegate.category_filter().clone()
+                && !categories.iter().any(|current| current == &name)
+            {
+                delegate.set_category_filter(CategoryFilter::All);
+            }
+            delegate.set_rows(rows);
+            delegate.set_selected(selected);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// 切换分类筛选。筛选状态住在 delegate 里——它才是过滤的人，两边各存一份迟早对不上。
+    fn set_category_filter(&self, filter: CategoryFilter, cx: &mut Context<Self>) {
+        self.list.update(cx, |state, cx| {
+            state.delegate_mut().set_category_filter(filter);
+            cx.notify();
+        });
+    }
+
+    fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.input.read(cx).value().to_string();
+        if add_repo_dialog::submit(&self.library, &self.runner, &self.input, &raw, window, cx) {
+            // 提交成功后对话框会关闭，这里只需要让列表立刻反映新增项。
+            self.sync_rows(cx);
+        }
+    }
+
+    fn repo_detail(&self, id: &str, cx: &Context<Self>) -> Option<RepoDetail> {
+        let library = self.library.read(cx);
+        let repo = library.repo(id)?;
+        Some(RepoDetail {
+            id: repo.id(),
+            full_name: repo.full_name.clone(),
+            url: repo.url.clone(),
+            description: repo.description.clone(),
+            description_zh: repo.description_zh.clone(),
+            language: repo.language.clone(),
+            stars: repo.stars,
+            discovered_at: repo.discovered_at,
+            created_at: repo.created_at,
+            source: repo.source.clone(),
+            category: repo.category.clone(),
+            tags: repo.tags.clone(),
+            pending: repo.has_pending_metadata(),
+        })
+    }
+
+    fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        add_repo_dialog::open(&self.input, &self.library, &self.runner, window, cx);
+    }
+
+    /// 把还缺字段的仓库交给后台补齐。配额有限，所以按设置里的批次上限走。
+    fn refresh_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let batch = self.library.read(cx).settings().metadata_batch as usize;
+        let pending = self.library.read(cx).repos_pending_metadata(batch);
+        if pending.is_empty() {
+            window.push_notification(Notification::info("没有待补全的仓库"), cx);
+            return;
+        }
+
+        let count = pending.len();
+        let started = self
+            .runner
+            .update(cx, |runner, cx| runner.refresh_metadata_now(pending, cx));
+        if started {
+            window.push_notification(Notification::info(format!("正在补全 {count} 个仓库")), cx);
+        } else {
+            window.push_notification(Notification::warning("后台任务正在运行，稍后再试"), cx);
+        }
+    }
+
+    /// 分类筛选条。词表为空时整条不画——只有一个「全部」的筛选条纯属占地方。
+    ///
+    /// 只列有仓库的分类，外加当前正选中的那个：空分类摆一排是噪音，但选中的
+    /// 那个必须留着，否则筛完之后连点回去的地方都没有。
+    fn render_filter_bar(&self, total: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (categories, uncategorized, filter) = {
+            let library = self.library.read(cx);
+            let categories: Vec<(String, usize)> = library
+                .names(TaxonomyKind::Category)
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        library.repo_count_using(TaxonomyKind::Category, name),
+                    )
+                })
+                .collect();
+            let filter = self.list.read(cx).delegate().category_filter().clone();
+            (categories, library.uncategorized_count(), filter)
+        };
+
+        if categories.is_empty() {
+            return None;
+        }
+
+        let (muted, border) = {
+            let theme = cx.theme();
+            (theme.muted_foreground, theme.border)
+        };
+
+        let mut chips: Vec<AnyElement> = Vec::new();
+        for (value, label, count) in std::iter::once((CategoryFilter::All, "全部".to_string(), total))
+            .chain(std::iter::once((
+                CategoryFilter::Uncategorized,
+                "未分类".to_string(),
+                uncategorized,
+            )))
+            .chain(
+                categories
+                    .into_iter()
+                    .map(|(name, count)| (CategoryFilter::Named(name.clone()), name, count)),
+            )
+        {
+            let active = filter == value;
+            // 没仓库的分类不摆出来，除非它正被选中。
+            if count == 0 && !active && value != CategoryFilter::All {
+                continue;
+            }
+
+            let mut button = Button::new(filter_element_id(&value))
+                .label(format!("{label} {count}"))
+                .small();
+            button = if active { button.primary() } else { button.outline() };
+            chips.push(
+                button
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_category_filter(value.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            v_flex()
+                .gap_1()
+                .pt_1()
+                .border_t_1()
+                .border_color(border)
+                .child(div().text_xs().text_color(muted).child("按分类看"))
+                .child(h_flex().flex_wrap().gap_1().children(chips))
+                .into_any_element(),
+        )
+    }
+
+    fn render_list_panel(
+        &self,
+        total: usize,
+        pending: usize,
+        visible: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let border = theme.border;
+        let background = theme.background;
+
+        let filter_bar = self.render_filter_bar(total, cx);
+        let count_text = if visible == total {
+            format!("{total} 个")
+        } else {
+            format!("{total} 个 · 筛出 {visible}")
+        };
+        let count_text = match pending {
+            0 => count_text,
+            pending => format!("{count_text} · {pending} 个待补全"),
+        };
+
+        v_flex()
+            .w(px(LIST_WIDTH))
+            .h_full()
+            .min_h_0()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(border)
+            .bg(background)
+            .child(
+                v_flex()
+                    .gap_3()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("仓库"))
+                                    .child(div().text_xs().text_color(muted).child(count_text)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("refresh-pending-metadata")
+                                            .icon(IconName::RefreshCw)
+                                            .ghost()
+                                            .small()
+                                            .tooltip("补全缺失的描述与创建时间")
+                                            .disabled(pending == 0)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.refresh_pending(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("open-add-repo")
+                                            .icon(IconName::Plus)
+                                            .label("添加")
+                                            .primary()
+                                            .small()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_add_dialog(window, cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .when_some(filter_bar, |this, bar| this.child(bar)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(List::new(&self.list).search_placeholder("搜索名称、描述、语言、分类或标签")),
+            )
+    }
+
+    fn render_empty_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(Icon::new(IconName::Bookmark).size_10().text_color(muted))
+            .child(div().text_color(muted).child("从左侧选一个仓库"))
+            .child(
+                Button::new("open-add-repo-from-empty")
+                    .icon(IconName::Plus)
+                    .label("添加仓库")
+                    .outline()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_add_dialog(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(id) = self.selected.clone() else {
+            return self.render_empty_detail(cx);
+        };
+        let Some(detail) = self.repo_detail(&id, cx) else {
+            return self.render_empty_detail(cx);
+        };
+
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let border = theme.border;
+        let dark = theme.is_dark();
+        let now = now_unix();
+
+        let source_text = detail.source.clone().unwrap_or_else(|| "手工添加".to_string());
+        let created_text = match detail.created_at {
+            Some(created_at) => {
+                format!("{}（{}）", format_local_date(created_at), format_relative(created_at, now))
+            }
+            None => "尚未取到".to_string(),
+        };
+        let stars_text = detail
+            .stars
+            .map(|stars| stars.to_string())
+            .unwrap_or_else(|| "未知".to_string());
+        let language_text = detail.language.clone().unwrap_or_else(|| "未识别".to_string());
+
+        // 描述块：汉语描述在上（它才是平时要读的那份），原文在下。
+        let zh_missing = detail
+            .description_zh
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .is_none();
+        let zh_block = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("汉语描述"),
+                            )
+                            .when(zh_missing, |this| {
+                                this.child(
+                                    Tag::secondary().small().child("未填写").into_any_element(),
+                                )
+                            }),
+                    )
+                    .child({
+                        let library = self.library.clone();
+                        let id = detail.id.clone();
+                        let full_name = detail.full_name.clone();
+                        let text = detail.description_zh.clone();
+                        Button::new("edit-zh-description")
+                            .icon(IconName::Pencil)
+                            .label(if zh_missing { "填写" } else { "编辑" })
+                            .ghost()
+                            .small()
+                            .on_click(move |_, window, cx| {
+                                edit_description_dialog::open(
+                                    library.clone(),
+                                    id.clone(),
+                                    full_name.clone(),
+                                    text.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                    }),
+            )
+            .child(match detail.description_zh.as_deref() {
+                Some(text) if !text.trim().is_empty() => div().child(text.to_string()),
+                _ => div().text_color(muted).child("还没写。写一句自己的话，之后列表里就显示它。"),
+            })
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child("原始描述（GitHub About）"),
+                    )
+                    .child(match detail.description.as_deref() {
+                        Some(text) if !text.trim().is_empty() => div().child(text.to_string()),
+                        _ => div()
+                            .text_color(muted)
+                            .child("尚未取到，点上面的「补全」按钮抓一次"),
+                    }),
+            );
+
+        // 分类与标签：一个仓库最多属于一个分类、可以挂多个标签，所以分类画一个
+        // 色块，标签横着铺一排。分类没有色块可画时就明说「未分类」。
+        let category_content = match detail.category.as_deref() {
+            Some(name) => chip::category_tag(name, dark).into_any_element(),
+            None => div().text_color(muted).child("未分类").into_any_element(),
+        };
+        let tag_chips: Vec<AnyElement> = detail
+            .tags
+            .iter()
+            .map(|tag| chip::tag_tag(tag).into_any_element())
+            .collect();
+        let tag_content = if tag_chips.is_empty() {
+            div().text_color(muted).child("没有标签").into_any_element()
+        } else {
+            h_flex().flex_wrap().gap_1().children(tag_chips).into_any_element()
+        };
+        let taxonomy_row = |label: &str, content: AnyElement| {
+            h_flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(52.))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(label.to_string()),
+                )
+                .child(div().flex_1().min_w_0().child(content))
+        };
+        let taxonomy_block = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child("分类与标签"),
+                    )
+                    .child({
+                        let library = self.library.clone();
+                        let id = detail.id.clone();
+                        let full_name = detail.full_name.clone();
+                        Button::new("edit-taxonomy")
+                            .icon(IconName::Tag)
+                            .label("编辑")
+                            .ghost()
+                            .small()
+                            .on_click(move |_, window, cx| {
+                                taxonomy_dialog::open(
+                                    library.clone(),
+                                    id.clone(),
+                                    full_name.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                    }),
+            )
+            .child(taxonomy_row("分类", category_content))
+            .child(taxonomy_row("标签", tag_content));
+
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .gap_4()
+            .p_6()
+            // 滚动方法在 `Stateful<Div>` 上，先给容器一个稳定 id 才能滚动。
+            .id("repo-detail-scroll")
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(detail.full_name.clone()),
+                            )
+                            .when(detail.pending, |this| {
+                                this.child(Tag::warning().small().child("待补全").into_any_element())
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("open-repo-url")
+                                    .icon(IconName::ExternalLink)
+                                    .label("打开仓库")
+                                    .outline()
+                                    .small()
+                                    .on_click({
+                                        let url = detail.url.clone();
+                                        move |_, _, cx| cx.open_url(&url)
+                                    }),
+                            )
+                            .child({
+                                let runner = self.runner.clone();
+                                let id = detail.id.clone();
+                                let full_name = detail.full_name.clone();
+                                Button::new("refresh-repo-metadata")
+                                    .icon(IconName::RefreshCw)
+                                    .label("刷新信息")
+                                    .ghost()
+                                    .small()
+                                    .on_click(move |_, window, cx| {
+                                        let started = runner.update(cx, |runner, cx| {
+                                            runner.refresh_metadata_now(vec![id.clone()], cx)
+                                        });
+                                        let note = if started {
+                                            Notification::info(format!("正在获取 {full_name}"))
+                                        } else {
+                                            Notification::warning("后台任务正在运行，稍后再试")
+                                        };
+                                        window.push_notification(note, cx);
+                                    })
+                            }),
+                    ),
+            )
+            .child(
+                DescriptionList::new()
+                    .columns(2)
+                    .label_width(px(76.))
+                    .item("地址", detail.url.clone(), 2)
+                    .item("语言", language_text, 1)
+                    .item("Star", stars_text, 1)
+                    .item(
+                        "发现时间",
+                        format!(
+                            "{}（{}）",
+                            format_local_minute(detail.discovered_at),
+                            format_relative(detail.discovered_at, now)
+                        ),
+                        2,
+                    )
+                    .item("创建时间", created_text, 2)
+                    .item("来源", source_text, 2),
+            )
+            .child(div().h(px(1.)).w_full().bg(border))
+            .child(taxonomy_block)
+            .child(div().h(px(1.)).w_full().bg(border))
+            .child(zh_block)
+            .child(
+                h_flex().justify_end().child({
+                    let library = self.library.clone();
+                    let list = self.list.clone();
+                    let id = detail.id.clone();
+                    let full_name = detail.full_name.clone();
+                    Button::new("remove-repo")
+                        .icon(IconName::Trash)
+                        .label("移除")
+                        .danger()
+                        .small()
+                        .on_click(move |_, window, cx| {
+                            // 汉语描述是人工成果，删掉就找不回来了，所以这里值得一次确认。
+                            let library = library.clone();
+                            let list = list.clone();
+                            let id = id.clone();
+                            let full_name = full_name.clone();
+                            window.open_dialog(cx, move |dialog, _, _| {
+                                let library = library.clone();
+                                let list = list.clone();
+                                let id = id.clone();
+                                let full_name = full_name.clone();
+                                dialog
+                                    .title("移除仓库")
+                                    .child(format!(
+                                        "把 {full_name} 从列表里移除？如果写过汉语描述，会一起丢掉。"
+                                    ))
+                                    .w(px(420.))
+                                    .footer(
+                                        DialogFooter::new()
+                                            .child(DialogClose::new().child(
+                                                Button::new("cancel-remove-repo")
+                                                    .label("取消")
+                                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                                            ))
+                                            .child(DialogAction::new().child(
+                                                Button::new("confirm-remove-repo")
+                                                    .label("移除")
+                                                    .danger(),
+                                            )),
+                                    )
+                                    .on_ok(move |_, window, cx| {
+                                        let removed = library.update(cx, |library, cx| {
+                                            let removed = library.remove_repo(&id);
+                                            if removed {
+                                                library.persist();
+                                                cx.notify();
+                                            }
+                                            removed
+                                        });
+                                        // 选中状态由列表持有，移除后必须一起清掉。
+                                        list.update(cx, |state, cx| {
+                                            state.delegate_mut().set_selected(None);
+                                            cx.notify();
+                                        });
+                                        if removed {
+                                            window.push_notification(
+                                                Notification::success(format!("已移除 {full_name}")),
+                                                cx,
+                                            );
+                                        }
+                                        true
+                                    })
+                            });
+                        })
+                }),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for ReposView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (total, pending, visible) = {
+            let library = self.library.read(cx);
+            let visible = self.list.read(cx).delegate().visible_count();
+            (
+                library.data().repos.len(),
+                library.pending_metadata_count(),
+                visible,
+            )
+        };
+
+        let theme = cx.theme();
+        let background = theme.background;
+        let foreground = theme.foreground;
+
+        let detail = self.render_detail(cx);
+        let list_panel = self.render_list_panel(total, pending, visible, cx);
+
+        h_flex()
+            .size_full()
+            .min_w_0()
+            .bg(background)
+            .text_color(foreground)
+            .child(list_panel)
+            .child(div().flex_1().min_w_0().h_full().child(detail))
+    }
+}
+
+/// 筛选按钮的身份。名字进到 id 里，别用下标——分类增删之后下标会错位。
+fn filter_element_id(filter: &CategoryFilter) -> ElementId {
+    match filter {
+        CategoryFilter::All => "repo-filter:all".into(),
+        CategoryFilter::Uncategorized => "repo-filter:uncategorized".into(),
+        CategoryFilter::Named(name) => format!("repo-filter:{name}").into(),
+    }
+}
