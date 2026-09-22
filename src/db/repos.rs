@@ -109,6 +109,20 @@ pub fn query_page(conn: &Connection, spec: &RepoQuerySpec) -> DbResult<(Vec<Repo
     Ok((repos, total as usize))
 }
 
+/// 当前条件下**全部**匹配的仓库 id，顺序跟列表一致。
+///
+/// 「全选」要选的是筛出来的整批，不是当前这一页：分页只是取的时候分，用户说的
+/// 「这些」是全部。所以这条查询刻意不带 `LIMIT/OFFSET`——`spec` 里那两个字段
+/// 在这里没有意义。
+pub fn ids_matching(conn: &Connection, spec: &RepoQuerySpec) -> DbResult<Vec<RepoId>> {
+    let (where_clause, filter_params) = build_filter(spec);
+
+    let sql = format!("SELECT r.id FROM repos r {where_clause} {ORDER_BY}");
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(filter_params.iter()), |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// 把筛选条件拼成 `WHERE` 子句与对应的位置参数。
 ///
 /// 只用无名 `?`：sqlite 的编号参数可以复用，但那样参数集合就必须跟着编号走，
@@ -265,6 +279,38 @@ pub fn set_category(conn: &Connection, id: &str, category_id: Option<i64>) -> Db
         params![category_id, id],
     )?;
     Ok(changed > 0)
+}
+
+/// 一批仓库一起改分类，返回真正写了多少行。
+///
+/// 一条 `UPDATE ... WHERE id IN (...)` 而不是逐个 `set_category`：界面上这是**一次**
+/// 操作，几百条逐个写就是几百次提交。调用方负责把它放进事务里。
+///
+/// id 里有库里没有的（列表上勾完又被别处删了）不算错，它们只是不会被改到——
+/// 返回的条数就是真被改到的那些，调用方拿它去说明结果。
+pub fn set_category_bulk(
+    conn: &Connection,
+    ids: &[RepoId],
+    category_id: Option<i64>,
+) -> DbResult<usize> {
+    if ids.is_empty() {
+        // `IN ()` 在 sqlite 里是语法错误；而且一条都没勾时本来也没什么好写的。
+        return Ok(0);
+    }
+
+    let list = vec!["?"; ids.len()].join(",");
+    let mut params: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+    params.push(match category_id {
+        Some(id) => Value::Integer(id),
+        None => Value::Null,
+    });
+    params.extend(ids.iter().map(|id| Value::Text(id.clone())));
+
+    let changed = conn.execute(
+        &format!("UPDATE repos SET category_id = ? WHERE id IN ({list})"),
+        params_from_iter(params.iter()),
+    )?;
+    Ok(changed)
 }
 
 /// 覆盖仓库的标签集合，顺序由调用方按词表排好。
@@ -648,5 +694,92 @@ mod tests {
             .unwrap();
         assert_eq!(links, 0);
         assert!(!exists(conn, "a/one").unwrap());
+    }
+
+    #[test]
+    fn a_batch_category_write_touches_exactly_the_ids_that_exist() {
+        let db = db();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO categories (id, parent_id, name, name_key) VALUES (1, NULL, '工具', '工具')",
+            [],
+        )
+        .unwrap();
+        for name in ["a/one", "b/two", "c/three"] {
+            insert(conn, &repo(name, 1), &[]).unwrap();
+        }
+
+        let picked = vec![
+            "a/one".to_string(),
+            "b/two".to_string(),
+            "查无此repo".to_string(),
+        ];
+        assert_eq!(
+            set_category_bulk(conn, &picked, Some(1)).unwrap(),
+            2,
+            "只有库里真有的那两条会被改到，条数也照实回报"
+        );
+
+        let (rows, total) = query_page(
+            conn,
+            &RepoQuerySpec {
+                category: CategoryScope::Subtrees(vec![1]),
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+
+        // `None` 是把它们移回未分类，同样是这一批。
+        assert_eq!(set_category_bulk(conn, &picked, None).unwrap(), 2);
+        let (rows, _) = query_page(
+            conn,
+            &RepoQuerySpec {
+                category: CategoryScope::Uncategorized,
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn an_empty_batch_writes_nothing_instead_of_failing() {
+        // `IN ()` 在 sqlite 里是语法错误，所以这条得在拼 SQL 之前就拦住。
+        let db = db();
+        let conn = db.conn();
+        assert_eq!(set_category_bulk(conn, &[], Some(1)).unwrap(), 0);
+    }
+
+    #[test]
+    fn selecting_all_matching_ids_ignores_the_page_window() {
+        let db = db();
+        let conn = db.conn();
+        for (name, language) in [("a/one", "Rust"), ("b/two", "Rust"), ("c/three", "Go")] {
+            let mut repo = repo(name, 1);
+            repo.language = Some(language.to_string());
+            insert(conn, &repo, &[]).unwrap();
+        }
+
+        // 一页只装一条，但「全选」要的是整批。
+        let ids = ids_matching(
+            conn,
+            &RepoQuerySpec {
+                language: Some("Rust".to_string()),
+                offset: 0,
+                limit: 1,
+                ..spec()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids,
+            ["a/one".to_string(), "b/two".to_string()],
+            "同语言的都在，顺序跟列表一致（同为发现时间就按名字）"
+        );
+
+        let all = ids_matching(conn, &spec()).unwrap();
+        assert_eq!(all.len(), 3, "没筛时就是全库");
     }
 }

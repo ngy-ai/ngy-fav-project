@@ -20,8 +20,9 @@ use gpui_kit::*;
 use crate::discovery::DiscoveryRunner;
 use crate::library::{CategoryRow, FacetRow, Library};
 use crate::repos::add_repo_dialog;
+use crate::repos::bulk_category_dialog;
 use crate::repos::edit_description_dialog;
-use crate::repos::list_delegate::RepoListDelegate;
+use crate::repos::list_delegate::{RepoListDelegate, SelectAll};
 use crate::repos::model::{CategoryFilter, RepoPage};
 use crate::repos::taxonomy_dialog;
 use crate::repos::RepoId;
@@ -174,13 +175,25 @@ impl ReposView {
             wanted.page = 0;
         }
 
-        let (page, selected_gone) = {
+        let (page, matching, selected_gone, checked_kept) = {
             let library = self.library.read(cx);
             (
                 library.query_repos(&wanted),
+                // 「全选」要的是筛出来的整批，而列表一次只取一页，所以这条单独查一次。
+                // 结果只用来算那个方框的样子，行本身不靠它。
+                library.repo_ids_matching(&wanted),
                 self.selected
                     .as_ref()
                     .is_some_and(|id| library.repo(id).is_none()),
+                // 勾选里已经不在库里的（列表上勾完，别处把它删了）要摘掉，否则
+                // 「已选 N 个」会一直多算那几个。勾着的通常没几个，扫一遍不贵。
+                self.list
+                    .read(cx)
+                    .delegate()
+                    .checked_ids()
+                    .into_iter()
+                    .filter(|id| library.repo(id).is_some())
+                    .collect::<Vec<RepoId>>(),
             )
         };
         // 被移除的仓库不能继续占着选中状态，否则详情面板会指向一个不存在的东西。
@@ -196,6 +209,10 @@ impl ReposView {
             delegate.set_category_filter(wanted.category.clone());
             delegate.set_language(wanted.language.clone());
             delegate.set_tags(wanted.tags.clone());
+            delegate.set_matching(matching);
+            if delegate.checked_count() != checked_kept.len() {
+                delegate.set_checked(checked_kept);
+            }
             let changed = delegate.accept_page(page);
             delegate.set_selected(selected);
             if changed {
@@ -245,6 +262,41 @@ impl ReposView {
             state.delegate_mut().clear_filters();
             cx.notify();
         });
+    }
+
+    /// 点「全选」：把当前筛出来的整批勾上；已经全勾上时反过来把它们摘掉。
+    fn toggle_select_all(&mut self, cx: &mut Context<Self>) {
+        self.list.update(cx, |state, cx| {
+            state.delegate_mut().toggle_select_all();
+            cx.notify();
+        });
+    }
+
+    /// 清空勾选。
+    fn clear_checked(&mut self, cx: &mut Context<Self>) {
+        self.list.update(cx, |state, cx| {
+            state.delegate_mut().clear_checked();
+            cx.notify();
+        });
+    }
+
+    /// 打开「整批改分类」。这批是**现在**勾着的那些，打开之后就定下来了。
+    fn open_bulk_category(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.list.read(cx).delegate().checked_ids();
+        let list = self.list.clone();
+        bulk_category_dialog::open(
+            self.library.clone(),
+            ids,
+            move |cx: &mut App| {
+                // 处理完了就把勾选清掉：留着只会让人以为还没做。
+                list.update(cx, |state, cx| {
+                    state.delegate_mut().clear_checked();
+                    cx.notify();
+                });
+            },
+            window,
+            cx,
+        );
     }
 
     /// 翻一页。已经在头尾时 delegate 不动，也就不会白查一次。
@@ -459,6 +511,111 @@ impl ReposView {
         )
     }
 
+    /// 列表上方的批量操作条：全选、勾了多少、整批改分类。
+    ///
+    /// 「全选」选的是**当前筛出来的整批**（跨页），不是这一页——分页只是取的时候
+    /// 分的，用户说的「这些」是全部，所以按钮上那个数字也是筛出来的总数。
+    ///
+    /// 那个方框是**三态**的：全勾上、勾了一部分、一个没勾。筛出 200 条勾了 3 条时
+    /// 摆一个空方框或满方框都是假话，而组件库的 `Checkbox` 只有这两种样子——
+    /// 所以这里用方框图标自己摆一个。
+    ///
+    /// 一条都没筛出来时整条不画：没东西可选，摆一排灰按钮纯属占地方。
+    fn render_batch_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (state, checked, total) = {
+            let delegate = self.list.read(cx).delegate();
+            (
+                delegate.select_all_state(),
+                delegate.checked_count(),
+                delegate.total(),
+            )
+        };
+        if total == 0 {
+            return None;
+        }
+
+        let (muted, border) = {
+            let theme = cx.theme();
+            (theme.muted_foreground, theme.border)
+        };
+
+        let all_icon = match state {
+            SelectAll::All => IconName::SquareCheck,
+            SelectAll::Partial => IconName::SquareMinus,
+            SelectAll::None => IconName::Square,
+        };
+        // 一个没勾时说清「全选」会选走多少，不然那个数只能靠猜。
+        let count_text = if checked == 0 {
+            format!("全选这 {total} 个")
+        } else {
+            format!("已选 {checked} 个")
+        };
+
+        let mut bar = h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                // 外面这层只为了给它一个可观测的身份（`Button` 挂不上 `test_support`）。
+                div().id("repo-select-all-slot").test_support().child(
+                    Button::new("repo-select-all")
+                        .icon(all_icon)
+                        .label("全选")
+                        .ghost()
+                        .small()
+                        .tooltip("选中上面筛出来的全部，不只是这一页")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_select_all(cx))),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(count_text),
+            );
+
+        // 没勾东西时操作按钮不摆：摆一排点不动的按钮只会让人去试。
+        if checked > 0 {
+            bar = bar
+                .child(
+                    div().id("repo-bulk-category-slot").test_support().child(
+                        Button::new("repo-bulk-category")
+                            .icon(IconName::FolderTree)
+                            .label("改分类")
+                            .outline()
+                            .small()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_bulk_category(window, cx)
+                                }),
+                            ),
+                    ),
+                )
+                .child(
+                    div().id("repo-clear-checked-slot").test_support().child(
+                        Button::new("repo-clear-checked")
+                            .icon(IconName::X)
+                            .ghost()
+                            .small()
+                            .tooltip("清空勾选")
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_checked(cx))),
+                    ),
+                );
+        }
+
+        Some(
+            v_flex()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(border)
+                .child(bar)
+                .into_any_element(),
+        )
+    }
+
     fn render_list_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -468,6 +625,7 @@ impl ReposView {
         // 库里的总数，不是当前这一页的条数。
         let total = self.library.read(cx).repo_count();
         let filter_bar = self.render_filter_bar(total, cx);
+        let batch_bar = self.render_batch_bar(cx);
         let (pending, page) = {
             let library = self.library.read(cx);
             (
@@ -536,7 +694,8 @@ impl ReposView {
                                     ),
                             ),
                     )
-                    .when_some(filter_bar, |this, bar| this.child(bar)),
+                    .when_some(filter_bar, |this, bar| this.child(bar))
+                    .when_some(batch_bar, |this, bar| this.child(bar)),
             )
             .child(
                 div()
@@ -1513,5 +1672,112 @@ mod tests {
         .unwrap();
         assert_eq!(language(cx), None);
         assert_eq!(total(cx), 3, "三条都回来了");
+    }
+
+    /// 勾选是批量操作的入口，而「点勾选框」跟「点这一行」是两件事：前者只该勾上，
+    /// 不该顺手把右边的详情面板也换过去（那样连勾五个就会看见详情来回乱跳）。
+    ///
+    /// 这条只有在无头窗口里真点一下才说得清——勾选框嵌在可点击的列表行里，
+    /// 事件怎么走是靠 gpui 的命中测试定的，光看代码看不出来。
+    #[gpui_kit::test]
+    fn the_checkbox_checks_without_stealing_the_row_click(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let library = cx.new(|_| seeded_library("check"));
+        let runner = cx.new(|cx| DiscoveryRunner::new(library.clone(), cx));
+        let slot: Rc<RefCell<Option<Entity<ReposView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| ReposView::new(library, runner, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        // 每次都要把 delegate 里的东西读出来；几个小闭包省得反复写借用。
+        let checked_count = |cx: &mut TestAppContext| {
+            let view = slot.borrow().clone().expect("窗口已经建好");
+            cx.update(|app| view.read(app).list.read(app).delegate().checked_count())
+        };
+        let checked_ids = |cx: &mut TestAppContext| {
+            let view = slot.borrow().clone().expect("窗口已经建好");
+            cx.update(|app| view.read(app).list.read(app).delegate().checked_ids())
+        };
+        let selection = |cx: &mut TestAppContext| {
+            let view = slot.borrow().clone().expect("窗口已经建好");
+            cx.update(|app| {
+                view.read(app)
+                    .list
+                    .read(app)
+                    .delegate()
+                    .selection()
+                    .cloned()
+            })
+        };
+        let click = |cx: &mut TestAppContext, id: &str| {
+            let id = id.to_string();
+            cx.update_window(handle.into(), move |_, window, cx| {
+                window.click(id, cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("repo-select-all-slot").is_some(),
+                "列表上方要有一条批量操作条"
+            );
+            assert!(
+                window.try_find("repo-bulk-category-slot").is_none(),
+                "什么都没勾时不摆操作按钮，摆一排点不动的只会让人去试"
+            );
+        })
+        .unwrap();
+
+        click(cx, "repo-check-slot:a/rust");
+        assert_eq!(checked_count(cx), 1, "点一下勾上一个");
+        assert_eq!(
+            selection(cx),
+            None,
+            "点勾选框不该顺手把详情面板换过去——那是「点这一行」的事"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("repo-bulk-category-slot").is_some(),
+                "勾上了才摆操作按钮"
+            );
+        })
+        .unwrap();
+
+        click(cx, "repo-check-slot:a/rust");
+        assert_eq!(checked_count(cx), 0, "再点一下摘掉");
+
+        // 「全选」勾的是筛出来的整批。
+        click(cx, "repo-select-all-slot");
+        assert_eq!(checked_count(cx), 3, "三条都在筛选结果里");
+        assert_eq!(selection(cx), None, "全选也不该动详情面板");
+
+        click(cx, "repo-select-all-slot");
+        assert_eq!(checked_count(cx), 0, "已经全勾上了，再点就是取消");
+
+        // 勾一个再「清空」，那个按钮管的正是这件事。
+        click(cx, "repo-check-slot:b/other");
+        click(cx, "repo-clear-checked-slot");
+        assert_eq!(checked_count(cx), 0);
+
+        // 换个筛选条件，全选跟着变——它从来不是「这一页」。
+        click(cx, "repo-language-filter-slot");
+        click(cx, "repo-language-filter-row:Rust");
+        click(cx, "repo-select-all-slot");
+        assert_eq!(
+            checked_ids(cx),
+            ["a/rust"],
+            "筛到只剩一条，全选就只勾这一条"
+        );
     }
 }

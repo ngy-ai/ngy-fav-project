@@ -49,13 +49,16 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
 ### 选东西用的下拉（`taxonomy/picker.rs`）
 
 - **一个 builder：`Picker::new(prefix, icon, label).rows(..).selected(..).accent(..).stretch()
-  .on_pick(..).into_element()`**。四处在用：筛选条的分类/语言/标签、改仓库分类的选框。这层只做
-  两件事——把行摆出来（`PickerRow`）、点一行之后把 **key** 交出去；**key 是什么意思由调用方解释**，
-  别把 `CategoryFilter` 或仓库带进来。
+  .on_pick(..).into_element()`**。五处在用：筛选条的分类/语言/标签、单个仓库改分类的选框、
+  整批改分类的选框。这层只做两件事——把行摆出来（`PickerRow`）、点一行之后把 **key** 交出去；
+  **key 是什么意思由调用方解释**，别把 `CategoryFilter` 或仓库带进来。单选分类用的行统一从
+  `picker::category_choice_rows(categories, false)` 出（最前面那条「不分类」的 key 是
+  `picker::NONE_KEY`，两处对话框共用，别各定一个常量）。
 - **`PickerRow.close` 决定点完收不收**（`keeping_open()` 造多选的行），picker 层没有「多选模式」
   这个概念。`selected: Vec<String>`，单选就是 0/1 个。
 - **元素 id 由 prefix 生成**：`{prefix}-slot` / `{prefix}-menu` / `{prefix}-row:{key}`。现用 prefix：
-  `repo-category-filter` / `repo-language-filter` / `repo-tag-filter` / `assign-category`。
+  `repo-category-filter` / `repo-language-filter` / `repo-tag-filter` / `assign-category` /
+  `bulk-category`。
 - **Popover 的 trigger 必须实现 `Selectable`**，而它只在 `Button`/`Checkbox`/`Input` 等具体类型上
   实现（`div()` 不算）→ trigger 由 picker 自己造成 `Button`，外面再包一层带 `test_support` 的 `div`
   当锚点。同一套办法用在行内的上移/下移按钮上（`Button` 挂不上 `test_support`）。
@@ -80,6 +83,23 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
   并回第一页。`delegate.has_facet_filters()` 和「清除」按钮管的必须是同一件事（它不动搜索词）。
 - **`list_delegate.rs` 是纯状态**（不碰数据库）；**`accept_page` 返回「变没变」，变了才
   `cx.notify()`**——无条件通知会转不停。
+- **勾选（`checked: BTreeSet<RepoId>`）跟 `selected` 是两件事**：后者是详情面板正在看的那一个。
+  勾选**跨页、跨筛选条件地留着**，只有仓库真被删了才摘（`retain_checked`，在 `sync_page` 里做）。
+- **「全选」选的是筛出来的整批，不是这一页**：`matching: Vec<RepoId>` 由视图查
+  `Library::repo_ids_matching`（不带 `LIMIT` 的 `SELECT id`）塞进 delegate，只用来算那个方框。
+  再点一次「全选」摘的是**匹配的那些**，不是整个勾选集合。方框是三态（`SelectAll`），
+  组件库的 `Checkbox` 只有两态，所以用 `SquareCheck`/`SquareMinus`/`Square` 图标自己摆。
+- **行里的勾选框外面那层要挂 `on_mouse_up(MouseButton::Left, cx.listener(|_,_,_,cx|
+  cx.stop_propagation()))`**：不挂的话点勾选框会连带动到列表行的 `on_click`，把右边的详情面板
+  也换过去。`window.prevent_default()`（组件库 `Checkbox` 自己调的）挡不住这件事——它只管
+  键盘激活的默认行为，鼠标点击的 listener 照走。
+- **批量改分类：`Library::set_repos_category(&ids, Option<&str>) -> Option<usize>`**，
+  库里是一条 `db::repos::set_category_bulk`（`UPDATE ... WHERE id IN (...)`，套在
+  `Db::transaction` 里；**空 ids 要在拼 SQL 前拦住，sqlite 的 `IN ()` 是语法错误**），
+  返回**真被改到的条数**。内存镜像一趟遍历改完，别逐个 `find`。
+- **批量对话框的 `on_saved` 是回调**（`F: Fn(&mut App) + Clone + 'static`）：对话框不该认识
+  列表，而「保存完把勾选清掉」得由列表自己做。`open_dialog` 的 builder 是 `Fn`、每帧都调，
+  所以捕获的东西必须 `Clone`。
 
 ## GPUI 界面与测试
 

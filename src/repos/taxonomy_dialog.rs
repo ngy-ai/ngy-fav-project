@@ -22,10 +22,7 @@ use crate::library::{CategoryRow, Library};
 use crate::repos::RepoId;
 use crate::shared::text::copyable_as;
 use crate::taxonomy::model::{self as tax, AddName, TaxonomyKind};
-use crate::taxonomy::picker::{self, PickerRow};
-
-/// 分类下拉里那个「不分类」固定项的 key。它不是一个分类，所以不能和路径撞名。
-const NONE_CATEGORY: &str = "none";
+use crate::taxonomy::picker;
 
 /// 打开编辑框。当前归属从 `Library` 现读，仓库已经不在了就直接不开。
 pub fn open(
@@ -312,12 +309,11 @@ impl AssignmentDraft {
         // 分类是单选，所以下拉树里最前面摆一个「不分类」；标签没有这个概念。
         let chooser: AnyElement = match kind {
             TaxonomyKind::Category => {
-                let mut rows = vec![PickerRow::fixed(NONE_CATEGORY, "不分类", None)];
-                rows.extend(picker::category_rows(categories, false));
+                let rows = picker::category_choice_rows(categories, false);
                 let selected = self
                     .category
                     .clone()
-                    .unwrap_or_else(|| NONE_CATEGORY.to_string());
+                    .unwrap_or_else(|| picker::NONE_KEY.to_string());
                 let draft = cx.entity();
                 picker::Picker::new(
                     "assign-category",
@@ -332,7 +328,7 @@ impl AssignmentDraft {
                 .stretch()
                 .on_pick(move |key, _window, cx| {
                     // 交出来的是分类路径，唯一要翻译的是那个固定项。
-                    let value = (key != NONE_CATEGORY).then_some(key);
+                    let value = (key != picker::NONE_KEY).then_some(key);
                     draft.update(cx, |this, cx| {
                         this.category = value;
                         cx.notify();

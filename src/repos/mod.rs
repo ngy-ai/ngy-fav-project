@@ -3,11 +3,12 @@
 pub mod model;
 
 mod add_repo_dialog;
+mod bulk_category_dialog;
 mod edit_description_dialog;
 mod list_delegate;
 mod repos_view;
 mod taxonomy_dialog;
 
-pub use list_delegate::RepoListDelegate;
+pub use list_delegate::{RepoListDelegate, SelectAll};
 pub use model::{CategoryFilter, Repo, RepoId, RepoRow, parse_full_name};
 pub use repos_view::ReposView;

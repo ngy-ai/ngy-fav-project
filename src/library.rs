@@ -12,7 +12,7 @@
 //! 一批节点，逐个去猜内存该怎么变既啰嗦又容易漏，所以写成功之后直接从库里
 //! 重读一遍——那张表只有几十行，重读比维护增量便宜。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::db::{self, Db};
@@ -621,6 +621,16 @@ impl Library {
         page
     }
 
+    /// 当前条件下**全部**匹配的仓库 id（跨页），顺序跟列表一致。
+    ///
+    /// 「全选」要选的是筛出来的整批，不是当前这一页：分页只是取的时候分，用户说的
+    /// 「这些」是全部。列表本身一次只取一页，所以这条查询单独走一次。
+    pub fn repo_ids_matching(&self, query: &RepoQuery) -> Vec<RepoId> {
+        let spec = self.build_spec(query);
+        self.read(|db| db::repos::ids_matching(db.conn(), &spec))
+            .unwrap_or_default()
+    }
+
     fn query_page_once(&self, query: &RepoQuery) -> RepoPage {
         let spec = self.build_spec(query);
         let Some((repos, total)) = self.read(|db| db::repos::query_page(db.conn(), &spec)) else {
@@ -1218,6 +1228,37 @@ impl Library {
         true
     }
 
+    /// 一批仓库一起改分类。返回库里**真被改到**的条数。
+    ///
+    /// 分类名必须已经在树上，这是跟单个仓库那条一样的规则；不在树上、或者落库失败
+    /// 时返回 `None`，这时一条都没改。整批放在一个事务里：中途出错就整批回滚，
+    /// 不会留下改了一半的一批。
+    ///
+    /// 只动分类，不碰标签——批量挂标签是另一件事，混在一起会让人以为「点了保存，
+    /// 标签怎么也没了」。
+    pub fn set_repos_category(&mut self, ids: &[RepoId], category: Option<&str>) -> Option<usize> {
+        let node = match category {
+            None => None,
+            Some(name) => Some(self.categories.find_path(name)?),
+        };
+        if ids.is_empty() {
+            return Some(0);
+        }
+
+        let changed =
+            self.write(|db| db.transaction(|tx| db::repos::set_category_bulk(tx, ids, node)))?;
+
+        // 内存镜像一次遍历改完：逐个 id 去 `find` 一遍是「条数 × 库大小」。
+        let picked: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        for repo in self.repos.iter_mut() {
+            let id = repo.id();
+            if picked.contains(id.as_str()) {
+                repo.category_id = node;
+            }
+        }
+        Some(changed)
+    }
+
     /// 覆盖仓库的标签集合，同样要求所有名字都已经在词表里。
     ///
     /// 存下来的顺序取词表顺序，而不是点击顺序：同一组标签在任何仓库上看起来都
@@ -1760,6 +1801,88 @@ mod tests {
         // 仓库不存在时也不能谎报成功。
         assert!(!library.set_repo_category("z/none", Some("工具")));
         assert!(!library.set_repo_tags("z/none", &[]));
+    }
+
+    #[test]
+    fn a_batch_category_change_moves_every_picked_repo_at_once() {
+        let mut library = library_with_repos("batch-category");
+
+        let picked = ["a/one".to_string(), "b/two".to_string()];
+        assert_eq!(library.set_repos_category(&picked, Some("工具")), Some(2));
+        assert_eq!(library.repo_category_path("a/one").as_deref(), Some("工具"));
+        assert_eq!(library.repo_category_path("b/two").as_deref(), Some("工具"));
+        assert_eq!(library.repo_category_path("c/three"), None, "没勾的不动");
+
+        // 换一个分类是整批替换。
+        assert_eq!(library.set_repos_category(&picked, Some("学习")), Some(2));
+        assert_eq!(library.repo_category_path("a/one").as_deref(), Some("学习"));
+
+        // `None` 是整批退回未分类。
+        assert_eq!(library.set_repos_category(&picked, None), Some(2));
+        assert_eq!(library.uncategorized_count(), 3);
+
+        // 不在树上的分类名：一条都不改，也不谎报成功。
+        assert_eq!(
+            library.set_repos_category(&picked, Some("没建过的分类")),
+            None
+        );
+        assert_eq!(library.repo_category_path("a/one"), None);
+
+        // 勾选里混了已经删掉的仓库：不报错，改到的条数照实回报。
+        let stale = ["a/one".to_string(), "查无此repo".to_string()];
+        assert_eq!(library.set_repos_category(&stale, Some("工具")), Some(1));
+        assert_eq!(library.repo_category_path("a/one").as_deref(), Some("工具"));
+    }
+
+    /// 整批改完要**落库**，不是只改了内存里那份。
+    #[test]
+    fn a_batch_category_change_survives_a_reopen() {
+        let dir = unique_dir("batch-persist");
+        let path = dir.join("library.db");
+        let mut library = Library::load_from(path.clone());
+        for repo in ["a/one", "b/two"] {
+            library.add_repo(Repo::new(repo.to_string(), None, 1));
+        }
+        library.add_name(TaxonomyKind::Category, "工具");
+
+        let picked = ["a/one".to_string(), "b/two".to_string()];
+        assert_eq!(library.set_repos_category(&picked, Some("工具")), Some(2));
+
+        let reloaded = Library::load_from(path);
+        assert_eq!(reloaded.load_warning(), None);
+        assert_eq!(
+            reloaded.repo_category_path("a/one").as_deref(),
+            Some("工具")
+        );
+        assert_eq!(
+            reloaded.repo_category_path("b/two").as_deref(),
+            Some("工具")
+        );
+    }
+
+    #[test]
+    fn selecting_all_matching_ids_follows_the_filters_not_the_page() {
+        let mut library = library_with_repos("matching-ids");
+        assert!(library.set_repo_category("a/one", Some("工具")));
+        assert!(library.set_repo_category("b/two", Some("工具")));
+
+        let query = RepoQuery {
+            category: CategoryFilter::Named("工具".to_string()),
+            page_size: 1,
+            ..RepoQuery::default()
+        };
+        assert_eq!(library.query_repos(&query).rows.len(), 1, "这一页只装得下一条");
+        assert_eq!(
+            library.repo_ids_matching(&query).len(),
+            2,
+            "「全选」拿到的是筛出来的整批，不是这一页"
+        );
+
+        let nothing = RepoQuery {
+            category: CategoryFilter::Named("没建过的分类".to_string()),
+            ..RepoQuery::default()
+        };
+        assert!(library.repo_ids_matching(&nothing).is_empty());
     }
 
     #[test]

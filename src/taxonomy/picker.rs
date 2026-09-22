@@ -83,6 +83,23 @@ pub fn category_rows(categories: Vec<CategoryRow>, show_count: bool) -> Vec<Pick
         .collect()
 }
 
+/// 单选一个分类时，最前面那条「不分类」的 key。
+///
+/// 它不是一个分类，所以不能和任何路径撞名。放在这里而不是各对话框自己定：
+/// 交出这个 key 的地方有两处（单个仓库改分类、整批改分类），两边得是同一个写法。
+pub const NONE_KEY: &str = "none";
+
+/// 单选分类用的选项：最前面摆一条「不分类」，再接分类树。
+///
+/// 「不分类」得是一个**能选中的选项**而不是「什么都不选」：把一个仓库从分类里拿出来
+/// 是常做的事，没有这一条就没法在同一个地方完成。
+pub fn category_choice_rows(categories: Vec<CategoryRow>, show_count: bool) -> Vec<PickerRow> {
+    let mut rows = Vec::with_capacity(categories.len() + 1);
+    rows.push(PickerRow::fixed(NONE_KEY, "不分类", None));
+    rows.extend(category_rows(categories, show_count));
+    rows
+}
+
 /// 选中一行之后的回调：把那一行的 key 交出去。
 ///
 /// 起个别名是因为 `Rc<dyn Fn(..)>` 直接写在签名里太长，而这个类型在 `content`
@@ -319,6 +336,32 @@ mod tests {
         let rows = category_rows(vec![category(1, "开发", "开发", 0, 5)], false);
         assert_eq!(rows[0].count, None);
         assert_eq!(rows[0].key, "开发", "key 始终是路径——身份不跟着显示变");
+    }
+
+    #[test]
+    fn a_category_choice_leads_with_none_and_then_the_tree() {
+        let rows = category_choice_rows(
+            vec![
+                category(1, "开发", "开发", 0, 5),
+                category(2, "开发/前端", "前端", 1, 3),
+            ],
+            false,
+        );
+        let shown: Vec<(&str, &str, usize)> = rows
+            .iter()
+            .map(|row| (row.key.as_str(), row.label.as_str(), row.depth))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("none", "不分类", 0),
+                ("开发", "开发", 0),
+                ("开发/前端", "前端", 1)
+            ],
+            "「不分类」摆在最前面，缩进从 0 起——它不在树的任何一层；key 始终是路径"
+        );
+        assert_eq!(rows[0].key, NONE_KEY);
+        assert!(rows.iter().all(|row| row.count.is_none()), "改分类跟仓库数无关");
     }
 
     /// 测试窗口的根：把下拉交出来的 key 记下来。
