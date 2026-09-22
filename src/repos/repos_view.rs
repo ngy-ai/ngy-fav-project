@@ -1094,6 +1094,8 @@ mod tests {
     fn category(id: i64, path: &str, leaf: &str, depth: usize, repos: usize) -> CategoryRow {
         CategoryRow {
             id,
+            // 拖拽排序才用得上；这里只摆下拉里的树，按路径取上级就够了。
+            parent: path.rsplit_once('/').map(|(parent, _)| parent.to_string()),
             path: path.to_string(),
             leaf: leaf.to_string(),
             depth,

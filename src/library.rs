@@ -50,6 +50,11 @@ pub struct CategoryRow {
     pub id: i64,
     pub path: String,
     pub leaf: String,
+    /// 上级的完整路径；顶层分类是 `None`。
+    ///
+    /// 拖拽排序要知道「谁跟谁同级」。这个判断必须从 `parent_id` 出，不能拿路径里的
+    /// 斜杠去猜——名字里带斜杠是输入语法，父子关系在树上是存出来的。
+    pub parent: Option<String>,
     pub depth: usize,
     /// 直接子分类数量。
     pub children: usize,
@@ -747,6 +752,13 @@ impl Library {
                     .sum();
                 CategoryRow {
                     id: flat.id,
+                    // 上级从树上问，不从 `path` 里切：名字里的斜杠只是输入语法，
+                    // 父子关系是存出来的。
+                    parent: self
+                        .categories
+                        .get(flat.id)
+                        .and_then(|node| node.parent)
+                        .and_then(|parent| self.categories.path(parent)),
                     path: flat.path,
                     leaf: flat.leaf,
                     depth: flat.depth,
@@ -978,6 +990,62 @@ impl Library {
         };
         if !moved {
             return MoveName::AtEdge;
+        }
+        self.reload_tags();
+        MoveName::Moved
+    }
+
+    /// 把词表里的一项放到同级另一个的前面/后面——拖拽落到哪里就是哪里，
+    /// 中间隔着几个都不用管，和 `move_name` 一次只挪一格不一样。
+    ///
+    /// 顺序只是界面上的摆放：分类的父子关系记在 `parent_id` 上，仓库的分类记在节点
+    /// id 上，标签关联也记在 id 上——所以这里一条仓库都不用回写。落点不在同一层
+    /// 就什么都不做：跨层换的是**上级**，那是「改名改路径」的活。
+    pub fn place_name(
+        &mut self,
+        kind: TaxonomyKind,
+        name: &str,
+        target: &str,
+        before: bool,
+    ) -> MoveName {
+        match kind {
+            TaxonomyKind::Category => self.place_category_name(name, target, before),
+            TaxonomyKind::Tag => self.place_tag_name(name, target, before),
+        }
+    }
+
+    fn place_category_name(&mut self, name: &str, target: &str, before: bool) -> MoveName {
+        let Some(id) = self.categories.find_path(name) else {
+            return MoveName::NotFound;
+        };
+        let Some(target_id) = self.categories.find_path(target) else {
+            return MoveName::NotFound;
+        };
+        let Some(placed) =
+            self.write(|db| db::taxonomy::place_category(db.conn(), id, target_id, before))
+        else {
+            return MoveName::Failed;
+        };
+        if !placed {
+            return MoveName::NotSibling;
+        }
+        self.reload_categories();
+        MoveName::Moved
+    }
+
+    fn place_tag_name(&mut self, name: &str, target: &str, before: bool) -> MoveName {
+        let Some(id) = self.tag_named(name).map(|tag| tag.id) else {
+            return MoveName::NotFound;
+        };
+        let Some(target_id) = self.tag_named(target).map(|tag| tag.id) else {
+            return MoveName::NotFound;
+        };
+        let Some(placed) = self.write(|db| db::taxonomy::place_tag(db.conn(), id, target_id, before))
+        else {
+            return MoveName::Failed;
+        };
+        if !placed {
+            return MoveName::NotSibling;
         }
         self.reload_tags();
         MoveName::Moved
@@ -1815,6 +1883,84 @@ mod tests {
             ["学习", "工具", "工具/编辑器", "工具/命令行"],
             "挪不动的那几次一条都没改"
         );
+    }
+
+    /// 拖拽的落点是「放到谁旁边」：中间隔着几个都一次到位，跨层则不接。
+    #[test]
+    fn placing_a_name_lands_it_next_to_the_target() {
+        let mut library = library_with_repos("place-name");
+        library.add_name(TaxonomyKind::Category, "工具/命令行");
+        library.add_name(TaxonomyKind::Category, "工具/编辑器");
+        assert!(library.set_repo_category("a/one", Some("工具/命令行")));
+
+        // 顶层两条换个位置：一步跨过整张表，不用一格一格挪。
+        assert_eq!(
+            library.place_name(TaxonomyKind::Category, "学习", "工具", false),
+            MoveName::Moved
+        );
+        assert_eq!(
+            library.names(TaxonomyKind::Category),
+            ["工具", "工具/命令行", "工具/编辑器", "学习"]
+        );
+
+        // 子分类之间拖，同样是一步到位。
+        assert_eq!(
+            library.place_name(TaxonomyKind::Category, "工具/命令行", "工具/编辑器", false),
+            MoveName::Moved
+        );
+        assert_eq!(
+            library.names(TaxonomyKind::Category),
+            ["工具", "工具/编辑器", "工具/命令行", "学习"]
+        );
+        assert_eq!(
+            library.repo_category_path("a/one").as_deref(),
+            Some("工具/命令行"),
+            "换的是位置，仓库还挂在原来那个分类下"
+        );
+
+        // 跨层不接：二级拖到顶层底下，或者反过来，都不是排序能表达的意思。
+        assert_eq!(
+            library.place_name(TaxonomyKind::Category, "工具/命令行", "学习", true),
+            MoveName::NotSibling
+        );
+        assert_eq!(
+            library.place_name(TaxonomyKind::Category, "工具", "工具/命令行", true),
+            MoveName::NotSibling
+        );
+        assert_eq!(
+            library.place_name(TaxonomyKind::Category, "工具", "工具", true),
+            MoveName::NotSibling,
+            "拖到自己身上"
+        );
+        assert_eq!(
+            library.place_name(TaxonomyKind::Category, "没有这个", "工具", true),
+            MoveName::NotFound
+        );
+        assert_eq!(
+            library.names(TaxonomyKind::Category),
+            ["工具", "工具/编辑器", "工具/命令行", "学习"],
+            "不接受的那几次一条都没改"
+        );
+    }
+
+    /// 标签是平的，整张表就是它的同级。
+    #[test]
+    fn placing_a_tag_lands_it_next_to_the_target() {
+        let mut library = library_with_repos("place-tag");
+        for tag in ["cli", "待读", "工具"] {
+            library.add_name(TaxonomyKind::Tag, tag);
+        }
+
+        assert_eq!(
+            library.place_name(TaxonomyKind::Tag, "cli", "工具", false),
+            MoveName::Moved
+        );
+        assert_eq!(library.names(TaxonomyKind::Tag), ["待读", "工具", "cli"]);
+        assert_eq!(
+            library.place_name(TaxonomyKind::Tag, "没有这个", "工具", true),
+            MoveName::NotFound
+        );
+        assert_eq!(library.names(TaxonomyKind::Tag), ["待读", "工具", "cli"]);
     }
 
     /// 摆好的顺序是要留到下次启动的，不是这一屏里的临时效果。

@@ -40,7 +40,9 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
   写库时把整段同级的 `position` 重写成 `0..n`——老数据里可能有并列值，只交换两条会被 id 序盖回去，
   看着像「点了没反应」。**改名 = 改名 + 移动**（填完整路径，改到自己下级 → `Circular`），
   所以别另做「移动分类」功能。**删分类连子树一起删**，仓库 `category_id` 置空
-  （外键 `ON DELETE SET NULL`）。
+  （外键 `ON DELETE SET NULL`）。**拖拽排序走 `place_name(kind, name, target, before)`**，
+  一步落到目标旁边（`place_category` / `place_tag`），落点只认同级（跨层 → `MoveName::NotSibling`，
+  一条都不改）；`CategoryRow.parent` 就是给「谁跟谁同级」用的，从 `parent_id` 出、不从 path 切。
 - **两个管理页**（`Page::Categories` / `Page::Tags`）是同一个 `TaxonomyView` 的两份实例，构造时传
   `TaxonomyKind`；别按 kind 存两份状态。**列表行的分类色块挂第一行**（`List` 要求所有行等高）。
 

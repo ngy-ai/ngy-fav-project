@@ -136,14 +136,7 @@ pub fn delete_tag(conn: &Connection, id: i64) -> DbResult<()> {
 /// **只动同级**：`开发/前端` 往前挪，换的是它上面那个兄弟的位置，不会跑到别的
 /// 上级底下去。返回 `false` 表示已经在头或尾，没有可挪的余地，这时一条都没改。
 pub fn reorder_category(conn: &Connection, id: i64, delta: i64) -> DbResult<bool> {
-    // 找不到这个 id 就什么都没得挪。`parent_id` 本身可能是 NULL（顶层），
-    // 所以这里是「两层 Option」：外面那层说有没有这个节点。
-    let found: Option<Option<i64>> = conn
-        .query_row("SELECT parent_id FROM categories WHERE id = ?", [id], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    let Some(parent) = found else {
+    let Some(parent) = category_parent(conn, id)? else {
         return Ok(false);
     };
 
@@ -167,6 +160,77 @@ pub fn reorder_tag(conn: &Connection, id: i64, delta: i64) -> DbResult<bool> {
     }
     rewrite_positions(conn, "tags", &ids)?;
     Ok(true)
+}
+
+/// 把某个分类放到同级里另一个分类的前面/后面。
+///
+/// 和 `reorder_category` 只挪一格不同，这里给的是**目标**：中间隔了几格都不用管，
+/// 一步到位——拖拽落点说的就是「放到它旁边」。目标必须与被挪的那个同级，跨层换
+/// 上级是「改名改路径」的事，排序里不做，所以这种情况返回 `false` 且一条都不改。
+pub fn place_category(conn: &Connection, id: i64, target: i64, before: bool) -> DbResult<bool> {
+    if id == target {
+        return Ok(false);
+    }
+    let Some(parent) = category_parent(conn, id)? else {
+        return Ok(false);
+    };
+    let Some(target_parent) = category_parent(conn, target)? else {
+        return Ok(false);
+    };
+    if parent != target_parent {
+        return Ok(false);
+    }
+
+    let mut ids = ordered_ids(
+        conn,
+        "SELECT id FROM categories WHERE parent_id IS ?1 ORDER BY position, id",
+        params![parent],
+    )?;
+    if !placed(&mut ids, id, target, before) {
+        return Ok(false);
+    }
+    rewrite_positions(conn, "categories", &ids)?;
+    Ok(true)
+}
+
+/// 标签是扁平的，整张表就是它的同级。
+pub fn place_tag(conn: &Connection, id: i64, target: i64, before: bool) -> DbResult<bool> {
+    if id == target {
+        return Ok(false);
+    }
+    let mut ids = ordered_ids(conn, "SELECT id FROM tags ORDER BY position, id", [])?;
+    if !placed(&mut ids, id, target, before) {
+        return Ok(false);
+    }
+    rewrite_positions(conn, "tags", &ids)?;
+    Ok(true)
+}
+
+/// 某个分类挂在谁下面。外面那层 `None` 是「库里没有这个 id」，内层的 `None` 是顶层
+/// ——`parent_id` 本来就允许是 NULL，所以这里非套两层不可。
+fn category_parent(conn: &Connection, id: i64) -> DbResult<Option<Option<i64>>> {
+    Ok(conn
+        .query_row("SELECT parent_id FROM categories WHERE id = ?", [id], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+/// 把 `id` 从 `ids` 里摘出来，插到 `target` 的前面/后面。两者缺一就返回 `false`，
+/// 此时 `ids` 一格都没动。
+fn placed(ids: &mut Vec<i64>, id: i64, target: i64, before: bool) -> bool {
+    let Some(from) = ids.iter().position(|it| *it == id) else {
+        return false;
+    };
+    let moved = ids.remove(from);
+    let Some(at) = ids.iter().position(|it| *it == target) else {
+        // 摘掉自己之后目标不见了，只可能是 `id == target`——调用方已经拦过，
+        // 这里只是把摘掉的放回去，别留下半截状态。
+        ids.insert(from, moved);
+        return false;
+    };
+    ids.insert(if before { at } else { at + 1 }, moved);
+    true
 }
 
 /// 读出一串 id，顺序就是现在界面上的顺序。
@@ -317,6 +381,21 @@ mod tests {
             .collect()
     }
 
+    /// 按路径找 id。要传 id 的地方先用它，测试里就不用一路拿着 `insert` 的返回值了。
+    fn id_of(conn: &Connection, path: &str) -> i64 {
+        crate::taxonomy::tree::CategoryTree::from_nodes(load_categories(conn).unwrap())
+            .find_path(path)
+            .unwrap_or_else(|| panic!("没有「{path}」这个分类"))
+    }
+
+    fn tag_names(conn: &Connection) -> Vec<String> {
+        load_tags(conn)
+            .unwrap()
+            .into_iter()
+            .map(|tag| tag.name)
+            .collect()
+    }
+
     /// 往前后挪一格换的是**同级**里的邻居。子分类挪到头也不会跑到顶层去——
     /// 同级按 `parent_id` 划，跟层级没有关系。
     #[test]
@@ -365,6 +444,57 @@ mod tests {
         assert!(!reorder_category(conn, only, -1).unwrap());
         assert!(!reorder_category(conn, 9999, 1).unwrap(), "不在库里");
         assert_eq!(paths(conn), ["开发", "开发/前端", "学习"]);
+    }
+
+    /// 拖拽给的落点是「放到谁旁边」，不是「挪几格」：一次到位，中间隔着几个都行。
+    #[test]
+    fn placing_lands_next_to_the_target_in_one_step() {
+        let db = db();
+        let conn = db.conn();
+        insert_category(conn, None, "开发").unwrap();
+        insert_category(conn, None, "学习").unwrap();
+        insert_category(conn, None, "工具").unwrap();
+
+        let study = id_of(conn, "学习");
+        // 「学习」拖到「工具」后面（从中间一次挪到末尾）。
+        assert!(place_category(conn, study, id_of(conn, "工具"), false).unwrap());
+        assert_eq!(paths(conn), ["开发", "工具", "学习"]);
+
+        // 再拖到最前面。
+        assert!(place_category(conn, study, id_of(conn, "开发"), true).unwrap());
+        assert_eq!(paths(conn), ["学习", "开发", "工具"]);
+    }
+
+    /// 落在别层就什么都不做：跨层换的是上级，那是「改名改路径」的活。
+    /// 子分类之间照样能拖——同级看的是 `parent_id`，跟深度无关。
+    #[test]
+    fn placing_refuses_to_cross_levels() {
+        let db = db();
+        let conn = db.conn();
+        let dev = insert_category(conn, None, "开发").unwrap();
+        insert_category(conn, Some(dev), "前端").unwrap();
+        insert_category(conn, Some(dev), "后端").unwrap();
+        insert_category(conn, None, "学习").unwrap();
+
+        let back = id_of(conn, "开发/后端");
+        assert!(place_category(conn, back, id_of(conn, "开发/前端"), true).unwrap());
+        assert_eq!(paths(conn), ["开发", "开发/后端", "开发/前端", "学习"]);
+
+        assert!(
+            !place_category(conn, back, id_of(conn, "学习"), true).unwrap(),
+            "二级拖到顶层：不同级"
+        );
+        assert!(
+            !place_category(conn, dev, id_of(conn, "开发/前端"), true).unwrap(),
+            "反过来也一样"
+        );
+        assert!(!place_category(conn, dev, dev, true).unwrap(), "拖到自己身上");
+        assert!(!place_category(conn, 9999, dev, false).unwrap(), "不在库里");
+        assert_eq!(
+            paths(conn),
+            ["开发", "开发/后端", "开发/前端", "学习"],
+            "不接受的那些一次都没改"
+        );
     }
 
     /// 老数据里同一个上级下可能有好几条 `position` 相同——只交换两条的话，
@@ -427,5 +557,27 @@ mod tests {
         assert!(reorder_tag(conn, later, 1).unwrap(), "换回来");
         assert_eq!(load_tags(conn).unwrap()[0].name, "cli");
         assert!(!reorder_tag(conn, 9999, -1).unwrap(), "不在库里");
+    }
+
+    /// 标签没有层级，整张表就是同级，拖到谁旁边就是谁旁边。
+    #[test]
+    fn placing_tags_lands_next_to_the_target() {
+        let db = db();
+        let conn = db.conn();
+        let cli = insert_tag(conn, "cli").unwrap();
+        let later = insert_tag(conn, "待读").unwrap();
+        let tools = insert_tag(conn, "工具").unwrap();
+
+        // cli 拖到「工具」后面：从开头一次挪到末尾。
+        assert!(place_tag(conn, cli, tools, false).unwrap());
+        assert_eq!(tag_names(conn), ["待读", "工具", "cli"]);
+
+        // 再拖到最前面。
+        assert!(place_tag(conn, cli, later, true).unwrap());
+        assert_eq!(tag_names(conn), ["cli", "待读", "工具"]);
+
+        assert!(!place_tag(conn, cli, cli, true).unwrap(), "拖到自己身上");
+        assert!(!place_tag(conn, 9999, later, true).unwrap(), "不在库里");
+        assert_eq!(tag_names(conn), ["cli", "待读", "工具"], "不接受的一次都没改");
     }
 }

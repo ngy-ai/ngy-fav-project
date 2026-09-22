@@ -27,6 +27,8 @@ struct Palette {
     foreground: Hsla,
     muted: Hsla,
     border: Hsla,
+    /// 拖拽落点那条线用的颜色。整页只有它一处强调色。
+    accent: Hsla,
     radius: Pixels,
     dark: bool,
 }
@@ -39,6 +41,7 @@ impl Palette {
             foreground: theme.foreground,
             muted: theme.muted_foreground,
             border: theme.border,
+            accent: theme.accent,
             radius: theme.radius,
             dark: theme.is_dark(),
         }
@@ -57,11 +60,62 @@ struct NameRow {
     depth: usize,
     /// 直接子分类数量；标签恒为 0。
     children: usize,
+    /// 同级分组键：上级的完整路径，顶层是空串（标签全在一个「层」里，也是空串）。
+    ///
+    /// 拖拽靠它判断落点接不接——同键才能互换位置，跨键换的是**上级**，那是
+    /// 「改名改路径」的事。这个键来自树上的 `parent_id`，不是从名字里切出来的。
+    level: String,
     /// 同级里它前面还有没有兄弟。没有就把「上移」灰掉——按下不会有任何反应，
     /// 不如直接说明没有余地。
     has_prev: bool,
     /// 同级里它后面还有没有兄弟。
     has_next: bool,
+}
+
+/// 拖拽期间记下的落点：放到哪一行的上面还是下面。
+#[derive(Clone, PartialEq, Eq)]
+struct DropHint {
+    /// 目标行的名字。分类是完整路径、标签是名字，本来就能唯一认人。
+    target: String,
+    /// `true` 落在目标行的上半（插到它前面），`false` 是下半。
+    before: bool,
+}
+
+/// 被拖动的名字。载荷只带「谁」和「它在哪一层」：写库只认名字，
+/// 层级是给落点判断用的。
+#[derive(Clone)]
+struct DraggingName {
+    name: String,
+    level: String,
+}
+
+/// 跟着光标走的小标签。gpui 自己把它摆在指针旁边，这里只管长什么样。
+struct DragGhost {
+    label: String,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = Palette::of(cx);
+        div()
+            .px_2()
+            .py_1()
+            .rounded(palette.radius)
+            .bg(palette.background)
+            .border_1()
+            .border_color(palette.accent)
+            .text_sm()
+            .text_color(palette.foreground)
+            .child(self.label.clone())
+    }
+}
+
+/// 能不能落在这一行上：被拖的那一项要和它**同级**，而且不是它自己。
+///
+/// 跨层换的是**上级**，那是「改名改路径」的活，排序做不到，所以这里不接——
+/// 拖拽途中不画线、松手也不动它。拖到自己身上同样没有意义。
+fn can_land_on(dragged: &DraggingName, target: &str, level: &str) -> bool {
+    dragged.name != target && dragged.level == level
 }
 
 pub struct TaxonomyView {
@@ -70,6 +124,9 @@ pub struct TaxonomyView {
     kind: TaxonomyKind,
     /// 新建名字的输入框。和「添加仓库」同样是长期持有的实体。
     input: Entity<InputState>,
+    /// 拖拽时落在哪一行、落在它上面还是下面。`None` 表示没有落点（没在拖，
+    /// 或者拖到别层去了）——没有落点就不画那条线。
+    drop_hint: Option<DropHint>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -104,6 +161,7 @@ impl TaxonomyView {
             library,
             kind,
             input,
+            drop_hint: None,
             _subscriptions: subscriptions,
         }
     }
@@ -150,6 +208,8 @@ impl TaxonomyView {
                 .category_rows()
                 .into_iter()
                 .map(|row| NameRow {
+                    // 上级的路径就是这一层的分组键；顶层没有上级，用空串。
+                    level: row.parent.unwrap_or_default(),
                     name: row.path,
                     leaf: row.leaf,
                     used_by: row.repos,
@@ -164,6 +224,8 @@ impl TaxonomyView {
                 .tags()
                 .iter()
                 .map(|tag| NameRow {
+                    // 标签是平的，全在一个层里。
+                    level: String::new(),
                     name: tag.name.clone(),
                     leaf: tag.name.clone(),
                     used_by: library.repo_count_using(TaxonomyKind::Tag, &tag.name),
@@ -191,7 +253,7 @@ impl TaxonomyView {
         let entries: Vec<AnyElement> = rows
             .into_iter()
             .enumerate()
-            .map(|(index, row)| self.render_row(row, index == last, palette))
+            .map(|(index, row)| self.render_row(row, index == last, palette, cx))
             .collect();
 
         let table = (!entries.is_empty()).then(|| {
@@ -260,9 +322,16 @@ impl TaxonomyView {
             .into_any_element()
     }
 
-    fn render_row(&self, row: NameRow, is_last: bool, palette: &Palette) -> AnyElement {
+    fn render_row(
+        &self,
+        row: NameRow,
+        is_last: bool,
+        palette: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let kind = self.kind;
         let name = row.name.clone();
+        let level = row.level.clone();
         let rename_id: ElementId = match kind {
             TaxonomyKind::Category => format!("rename-category:{}", row.name).into(),
             TaxonomyKind::Tag => format!("rename-tag:{}", row.name).into(),
@@ -276,8 +345,17 @@ impl TaxonomyView {
         let indent = 12. + (row.depth.saturating_sub(1) as f32) * 18.;
         // 沿用别人的分类来新建下级：上级已经在手边，不用再打一遍路径。
         let add_child_id: ElementId = format!("add-child:{}", row.name).into();
+        let row_id: ElementId = format!("taxonomy-row:{}", row.name).into();
+        // 这一行是不是当前落点；`Some(true)` 落在上半、`Some(false)` 落在下半。
+        let landing = self
+            .drop_hint
+            .as_ref()
+            .filter(|hint| hint.target == row.name)
+            .map(|hint| hint.before);
 
-        h_flex()
+        // 行的内容本身照旧，拖拽那一圈挂在外面——包一层是为了能挂绝对定位的落点线，
+        // 它不能进布局，否则行高一变，鼠标就跑到行外去了。
+        let body = h_flex()
             .w_full()
             .gap_3()
             .justify_between()
@@ -417,13 +495,117 @@ impl TaxonomyView {
                                 }
                             }),
                     ),
+            );
+
+        div()
+            .id(row_id)
+            .test_support()
+            .relative()
+            .w_full()
+            // 整行都是拖拽把手，不用先去瞄准某一处文字。落点接不接由接收行自己判断，
+            // 所以载荷里要带上被拖那一行的层级。
+            .on_drag(
+                DraggingName {
+                    name: row.name.clone(),
+                    level: row.level.clone(),
+                },
+                |dragged, _, _, cx| {
+                    cx.new(|_| DragGhost {
+                        label: dragged.name.clone(),
+                    })
+                },
             )
+            .on_drag_move::<DraggingName>(cx.listener({
+                let name = row.name.clone();
+                let level = level.clone();
+                move |this, event: &DragMoveEvent<DraggingName>, _, cx| {
+                    // 拖拽移动事件是发给**每个**元素的，不是只发给鼠标下面那一个，
+                    // 「指针在不在我身上」得自己算。不在我身上的行要闭嘴，否则会把
+                    // 真正落在的那一行刚设好的落点覆盖掉。
+                    let inside = event.bounds.contains(&event.event.position);
+                    let dragged = event.drag(cx);
+                    // 落在上半就是插到它前面，下半就是后面。
+                    let before = event.event.position.y < event.bounds.center().y;
+                    let hint = (inside && can_land_on(dragged, &name, &level)).then(|| DropHint {
+                        target: name.clone(),
+                        before,
+                    });
+                    this.set_drop_hint(&name, hint, cx);
+                }
+            }))
+            .on_drop::<DraggingName>(cx.listener({
+                let name = row.name.clone();
+                let level = level.clone();
+                move |this, dragged: &DraggingName, window, cx| {
+                    // 方向取拖拽途中记下的落点；按下就松手（还没记上）当作落在下半。
+                    let before = this
+                        .drop_hint
+                        .as_ref()
+                        .filter(|hint| hint.target == name)
+                        .map(|hint| hint.before)
+                        .unwrap_or(false);
+                    this.drop_hint = None;
+                    cx.notify();
+
+                    // 跨层、或者拖到自己身上：什么都不做。拖的时候就没给过落点线，
+                    // 这里也就安静走开——为什么不能跨层，页头那句说明里写着。
+                    if !can_land_on(dragged, &name, &level) {
+                        return;
+                    }
+                    place_name(
+                        &this.library,
+                        kind,
+                        dragged.name.clone(),
+                        name.clone(),
+                        before,
+                        window,
+                        cx,
+                    );
+                }
+            }))
+            .child(body)
+            .when_some(landing, |this, before| {
+                this.child(drop_line(palette, before))
+            })
             .into_any_element()
+    }
+
+    /// 记下落点并重画。
+    ///
+    /// 每一行都会收到拖拽移动事件，所以这里是所有行轮流来设。规矩是：落点由
+    /// **指针真正落在的那一行**说了算；指针不在我身上的那些行只在落点还留在自己
+    /// 这儿时才负责撤掉，不然它们会把刚设好的落点抹回去。
+    ///
+    /// 只在真的变了的时候通知——鼠标每动一像素都通知一次，整页就一直在重画。
+    fn set_drop_hint(&mut self, mine: &str, hint: Option<DropHint>, cx: &mut Context<Self>) {
+        let changed = match hint {
+            Some(hint) => {
+                let changed = self.drop_hint.as_ref() != Some(&hint);
+                self.drop_hint = Some(hint);
+                changed
+            }
+            None => match &self.drop_hint {
+                Some(current) if current.target == mine => {
+                    self.drop_hint = None;
+                    true
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            cx.notify();
+        }
     }
 }
 
 impl Render for TaxonomyView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 落点线只在拖拽期间有意义。松手的地方不一定有回调可挂（拖到空白处、拖出窗口、
+        // 在别层松手），所以在这一帧发现拖拽已经结束，就把残留的落点收掉。
+        if self.drop_hint.is_some() && !cx.has_active_drag() {
+            self.drop_hint = None;
+        }
+
         let palette = Palette::of(cx);
         let kind = self.kind;
         let count = self.library.read(cx).names(kind).len();
@@ -553,10 +735,58 @@ fn move_name(
             "「{name}」已经在{}了",
             if delta < 0 { "最前面" } else { "最后面" }
         )),
+        // `move_name` 只换邻近的一条，落不到别层去。
+        MoveName::NotSibling => return,
         MoveName::NotFound => Notification::warning(format!("「{name}」已经不在词表里了")),
         MoveName::Failed => Notification::error(write_failed_note()),
     };
     window.push_notification(note, cx);
+}
+
+/// 把拖来的那一项放到目标行的前面/后面，再把结果说给用户听。
+fn place_name(
+    library: &Entity<Library>,
+    kind: TaxonomyKind,
+    name: String,
+    target: String,
+    before: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let outcome = library.update(cx, |library, cx| {
+        let outcome = library.place_name(kind, &name, &target, before);
+        if outcome == MoveName::Moved {
+            cx.notify();
+        }
+        outcome
+    });
+
+    let note = match outcome {
+        // 顺序变了，这一页上直接看得见，不用再弹一句。
+        MoveName::Moved => return,
+        // 跨层在拖拽那一步就该被拦下（不画线就是不能落），走到这里说明是刚好卡在
+        // 边界上松的手。把规矩再讲一遍。
+        MoveName::NotSibling => Notification::warning(format!(
+            "「{name}」和「{target}」不在同一层，只能和同级的换位置"
+        )),
+        MoveName::AtEdge => Notification::warning(format!("「{name}」已经在原来的位置了")),
+        MoveName::NotFound => Notification::warning(format!("「{name}」已经不在词表里了")),
+        MoveName::Failed => Notification::error(write_failed_note()),
+    };
+    window.push_notification(note, cx);
+}
+
+/// 拖拽落点那条线。用绝对定位是因为它不能进布局：进布局的话行高一变，鼠标一下
+/// 就不在这一行上了，落点在「有」和「没有」之间来回翻，线跟着闪。
+fn drop_line(palette: &Palette, before: bool) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .h(px(2.))
+        .bg(palette.accent)
+        .map(|this| if before { this.top_0() } else { this.bottom_0() })
+        .into_any_element()
 }
 
 /// 页面头部那句说明。两种词表的区别只在归属规则上，说清楚这一点就够了。
@@ -565,11 +795,13 @@ fn page_note(kind: TaxonomyKind) -> &'static str {
         TaxonomyKind::Category => {
             "分类可以分级，用 / 表示层级，如「开发/前端」。一个仓库最多只属于一个分类，\
              选中上级就等于同时属于它下面所有分类；筛选时也按整棵子树算。归属在「仓库」页\
-             点「编辑」设置，这里管的是有哪些分类。"
+             点「编辑」设置，这里管的是有哪些分类。把一行拖到另一行上就能换顺序，\
+             但只能和同级的换——要挪到别的上级底下，用「改名」把路径改掉。"
         }
         TaxonomyKind::Tag => {
             "一个仓库可以挂任意多个标签。归属在「仓库」页选中项目后点「编辑」设置；\
-             这里管的是有哪些标签。改名与删除会同时改到已经挂上它的仓库上。"
+             这里管的是有哪些标签。改名与删除会同时改到已经挂上它的仓库上。\
+             把一行拖到另一行上就能换顺序。"
         }
     }
 }
@@ -1018,6 +1250,8 @@ mod tests {
     #[test]
     fn siblings_are_found_by_depth_not_by_the_line_above() {
         let row = |name: &str, depth: usize| NameRow {
+            // 这条只考同级标记，拖拽用的层级键填个空的就行。
+            level: String::new(),
             name: name.to_string(),
             leaf: name.to_string(),
             used_by: 0,
@@ -1046,5 +1280,103 @@ mod tests {
                 (true, false),  // 学习：前面是开发
             ]
         );
+    }
+
+    /// 建一个只放这一页的无头窗口，返回窗口句柄和视图句柄。
+    ///
+    /// 视图要单独留一份：`cx.update_window` 给的是 `AnyView`，从它身上读不到字段，
+    /// 断言得从自己手上这个句柄进。
+    fn view_window(
+        cx: &mut TestAppContext,
+        seed: &str,
+        kind: TaxonomyKind,
+    ) -> (AnyWindowHandle, Entity<TaxonomyView>) {
+        let library = cx.new(|_| seeded_library(seed));
+        let slot: Rc<RefCell<Option<Entity<TaxonomyView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| TaxonomyView::new(library, kind, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Shell { view }
+            })
+        };
+        let view = slot.borrow().clone().expect("建窗口的时候就放好了");
+        (handle.into(), view)
+    }
+
+    /// 把 `from` 那一行拖到 `to` 那一行的上半/下半。
+    ///
+    /// 落点认的就是「指针落在目标行的哪一半」，所以这里按行的实际位置算落点，
+    /// 不能直接取中心——取中心永远算作下半。
+    fn drag_row(window: &mut Window, from: &str, to: &str, before: bool, cx: &mut App) {
+        let start = window.find(format!("taxonomy-row:{from}")).bounds().center();
+        let target = window.find(format!("taxonomy-row:{to}")).bounds();
+        let y = if before {
+            target.origin.y + px(2.)
+        } else {
+            target.origin.y + target.size.height - px(2.)
+        };
+        window.drag(start, point(target.origin.x + target.size.width / 2., y), cx);
+    }
+
+    /// 拖拽换顺序：一步到位，不用一格一格挪。拖到上半是插到它前面，下半是后面。
+    #[gpui_kit::test]
+    fn dragging_a_row_lands_it_next_to_the_target(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = view_window(cx, "drag-row", TaxonomyKind::Category);
+        let names = |cx: &mut TestAppContext| {
+            cx.update(|app| {
+                view.read(app)
+                    .library
+                    .read(app)
+                    .names(TaxonomyKind::Category)
+            })
+        };
+
+        assert_eq!(names(cx), ["工具", "工具/前端", "学习", "学习/书"]);
+
+        // 「学习」拖到「工具」上半：插到工具前面，子分类跟着上级一起走。
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            drag_row(window, "学习", "工具", true, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(
+            names(cx),
+            ["学习", "学习/书", "工具", "工具/前端"],
+            "一步到位，不用一格一格挪"
+        );
+
+        // 拖到「工具」下半：又回到工具后面。
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            drag_row(window, "学习", "工具", false, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(names(cx), ["工具", "工具/前端", "学习", "学习/书"]);
+    }
+
+    /// 落点接不接：同级、不是自己，而且指针得真的落在这一行上。
+    ///
+    /// 层层都接不住的那两种情况是「跨层要换上级，得去改名」；指针那一条是因为
+    /// 拖拽移动事件发给了**每个**元素，不自己圈范围的话，全表同级的行会轮流设落点，
+    /// 最后落在谁头上全看渲染顺序。
+    #[test]
+    fn a_landing_is_only_accepted_on_the_same_level() {
+        let dragged = DraggingName {
+            name: "工具/前端".to_string(),
+            level: "工具".to_string(),
+        };
+
+        assert!(can_land_on(&dragged, "工具/后端", "工具"), "同级之间随便换");
+        assert!(
+            !can_land_on(&dragged, "学习", ""),
+            "顶层不接二级：跨层换的是上级"
+        );
+        assert!(!can_land_on(&dragged, "学习/书", "学习"), "别家的子分类也不接");
+        assert!(!can_land_on(&dragged, "工具/前端", "工具"), "拖到自己身上");
     }
 }
