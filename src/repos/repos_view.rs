@@ -12,6 +12,7 @@ use gpui_kit::component::{
     input::{InputEvent, InputState},
     list::{List, ListState},
     notification::Notification,
+    resizable::{ResizableState, h_resizable, resizable_panel},
     tag::Tag,
 };
 use gpui_kit::prelude::*;
@@ -32,8 +33,12 @@ use crate::taxonomy::chip;
 use crate::taxonomy::model as tax;
 use crate::taxonomy::picker::{self, PickerRow};
 
-/// 列表栏宽度。固定宽度让详情面板有稳定的阅读宽度，也避免拖拽时重新布局。
+/// 列表栏一开始多宽。之后由分栏状态记着，拖出来的就是它。
 const LIST_WIDTH: f32 = 320.;
+
+/// 列表栏能拖到的范围。下限保证名字还看得见，上限保证详情面板还有地方待。
+const LIST_MIN_WIDTH: f32 = 240.;
+const LIST_MAX_WIDTH: f32 = 560.;
 
 /// 详情面板需要的一次性快照。
 ///
@@ -61,6 +66,9 @@ pub struct ReposView {
     list: Entity<ListState<RepoListDelegate>>,
     /// 「添加仓库」对话框的输入框。由本视图长期持有，原因见 `add_repo_dialog`。
     input: Entity<InputState>,
+    /// 列表 ↔ 详情那一刀的分栏状态。宽度记在它里面——它自己每帧都在量、
+    /// 在改，另存一份镜像迟早对不上。
+    split: Entity<ResizableState>,
     selected: Option<RepoId>,
     _subscriptions: Vec<Subscription>,
 }
@@ -78,6 +86,7 @@ impl ReposView {
                 .placeholder("owner/repo 或 https://github.com/owner/repo")
                 .submit_on_enter(true)
         });
+        let split = cx.new(|_| ResizableState::default());
 
         let mut subscriptions = Vec::new();
 
@@ -112,6 +121,7 @@ impl ReposView {
             runner,
             list,
             input,
+            split,
             selected: None,
             _subscriptions: subscriptions,
         };
@@ -645,7 +655,9 @@ impl ReposView {
         };
 
         v_flex()
-            .w(px(LIST_WIDTH))
+            // 宽度交给分栏的那块面板；这里再写死一个像素值，拖动时就会「面板变了、
+            // 列表没变」。右边那道竖线保留：它是列表与详情之间的那道分隔。
+            .w_full()
             .h_full()
             .min_h_0()
             .flex_shrink_0()
@@ -1124,8 +1136,23 @@ impl Render for ReposView {
             .min_w_0()
             .bg(background)
             .text_color(foreground)
-            .child(list_panel)
-            .child(div().flex_1().min_w_0().h_full().child(detail))
+            .child(
+                // 两块面板，中间那一刀可以拖。宽度记在分栏状态里，翻页、换筛选、
+                // 切页面都不会动到它。
+                h_resizable("repos-split")
+                    .with_state(&self.split)
+                    .child(
+                        resizable_panel()
+                            .size(px(LIST_WIDTH))
+                            .size_range(px(LIST_MIN_WIDTH)..px(LIST_MAX_WIDTH))
+                            // 列表栏是固定宽度的那一块，别跟着详情一起长。
+                            .flex_none()
+                            // 这一层只为量尺寸：无头窗口里要能量到列表栏实际多宽，
+                            // 好确认拖动真的落到了布局上，而不只是改了状态里的数。
+                            .child(div().id("repo-list-column").test_support().size_full().child(list_panel)),
+                    )
+                    .child(resizable_panel().child(div().flex_1().min_w_0().h_full().child(detail))),
+            )
     }
 }
 
@@ -1779,5 +1806,86 @@ mod tests {
             ["a/rust"],
             "筛到只剩一条，全选就只勾这一条"
         );
+    }
+
+    /// 列表与详情之间那一刀能拖。宽度这件事只有真拖一遍才说得清：分栏状态里
+    /// 存着数与布局真的按它铺开，是两回事。
+    ///
+    /// 抓手在分隔条**左边那 4 个像素**里（组件库把把手画成一条 1px 的线、往左让出
+    /// 4px 的抓取带），所以 `from` 取「列表栏宽度 - 2」。
+    #[gpui_kit::test]
+    fn the_divider_between_the_list_and_the_detail_can_be_dragged(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let library = cx.new(|_| seeded_library("split"));
+        let runner = cx.new(|cx| DiscoveryRunner::new(library.clone(), cx));
+        let slot: Rc<RefCell<Option<Entity<ReposView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| ReposView::new(library, runner, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = slot.borrow().clone().expect("窗口已经建好");
+            // 列表栏**渲染出来**多宽。分栏里那个数只是它的来源，两者不一致就是
+            // 「状态变了、布局没动」那类错，光看状态是发现不了的。
+            let list_column = |window: &mut Window| -> f32 {
+                window
+                    .find("repo-list-column")
+                    .bounds()
+                    .size
+                    .width
+                    .as_f32()
+            };
+            let state_width = |cx: &App| -> f32 {
+                view.read(cx)
+                    .split
+                    .read(cx)
+                    .sizes()
+                    .first()
+                    .map(|size| size.as_f32())
+                    .unwrap_or_default()
+            };
+
+            window.render_frame(cx);
+            let list = list_column(window);
+            assert!(
+                (list - LIST_WIDTH).abs() < 1.,
+                "一开始是 {LIST_WIDTH}：{list}"
+            );
+            assert!(
+                (state_width(cx) - list).abs() < 1.,
+                "分栏记的宽度与铺出来的宽度得是同一个数"
+            );
+
+            // 抓住分隔条往右拖 118。
+            let y = window.viewport_size().height / 2.;
+            window.drag(point(px(list - 2.), y), point(px(list + 118.), y), cx);
+            window.render_frame(cx);
+            let wider = list_column(window);
+            assert!(
+                (wider - (list + 118.)).abs() < 1.5,
+                "列表栏要跟着光标走：{wider}（本来 {list}）"
+            );
+            assert!(
+                (state_width(cx) - wider).abs() < 1.5,
+                "宽度落到了布局上，分栏里也该是同一个数：{}",
+                state_width(cx)
+            );
+
+            // 往左拖过头会被下限拦住：详情不该被挤成一条缝。
+            window.drag(point(px(wider - 2.), y), point(px(10.), y), cx);
+            window.render_frame(cx);
+            assert!(
+                (list_column(window) - LIST_MIN_WIDTH).abs() < 1.5,
+                "拖到下限就停住：{}",
+                list_column(window)
+            );
+        })
+        .unwrap();
     }
 }
