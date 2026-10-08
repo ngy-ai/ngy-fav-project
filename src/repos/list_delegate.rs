@@ -358,6 +358,14 @@ impl RepoListDelegate {
     pub fn row_at(&self, ix: IndexPath) -> Option<&RepoRow> {
         self.page.rows.get(ix.row)
     }
+
+    /// 某个仓库在当前这一页里排第几行。不在这一页（被筛掉了、或者不在这一页）给 `None`。
+    ///
+    /// 「按 id 选中」得先换成行号：列表记选中的是**行号**
+    /// （`ListState::set_selected_index`），而行号只对当前这一页有意义。
+    pub fn position_of(&self, id: &str) -> Option<usize> {
+        self.page.rows.iter().position(|row| row.id == id)
+    }
 }
 
 impl ListDelegate for RepoListDelegate {
@@ -789,6 +797,24 @@ mod tests {
         assert_eq!(delegate.total(), 120);
         assert_eq!(delegate.visible_count(), 2);
         assert_eq!(delegate.page().page_count(), 3);
+    }
+
+    /// 「按 id 选中」要先换成行号，而**行号只对当前这一页有意义**：同一个 id
+    /// 在第一页是第 1 行，在第二页可能根本不在。换错了就会选到别人身上。
+    #[test]
+    fn a_repo_is_located_by_id_within_the_current_page_only() {
+        let mut delegate = RepoListDelegate::new();
+        delegate.accept_page(page(200, 0, &["a/one", "b/two", "c/three"]));
+        assert_eq!(delegate.position_of("b/two"), Some(1));
+        assert_eq!(delegate.position_of("不在这一页"), None);
+
+        delegate.accept_page(page(200, 1, &["d/four"]));
+        assert_eq!(delegate.position_of("d/four"), Some(0));
+        assert_eq!(
+            delegate.position_of("b/two"),
+            None,
+            "翻了页就不在这一页上了，行号得重新算"
+        );
     }
 
     #[test]

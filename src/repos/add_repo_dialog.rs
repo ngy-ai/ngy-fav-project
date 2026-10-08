@@ -20,13 +20,20 @@ use crate::repos::model::{Repo, parse_full_name};
 use crate::shared::clock::now_unix;
 use crate::shared::text::copyable;
 
-pub fn open(
+/// 打开对话框。
+///
+/// `on_added` 在真的加进去之后调用一次，带上它的 id，让列表把新加的这个选中。
+/// 写成回调而不是在这里直接动列表：对话框本来就不该知道是谁打开的它。
+pub fn open<F>(
     input: &Entity<InputState>,
     library: &Entity<Library>,
     runner: &Entity<DiscoveryRunner>,
+    on_added: F,
     window: &mut Window,
     cx: &mut App,
-) {
+) where
+    F: Fn(&str, &mut Window, &mut App) + Clone + 'static,
+{
     let input = input.clone();
     let library = library.clone();
     let runner = runner.clone();
@@ -37,6 +44,7 @@ pub fn open(
         let library = library.clone();
         let runner = runner.clone();
         let input = input.clone();
+        let on_added = on_added.clone();
 
         dialog
             .title("添加仓库")
@@ -63,7 +71,7 @@ pub fn open(
             )
             .on_ok(move |_, window, cx| {
                 let raw = input.read(cx).value().to_string();
-                submit(&library, &runner, &input, &raw, window, cx)
+                submit(&library, &runner, &input, &raw, on_added.clone(), window, cx)
             })
     });
 }
@@ -71,14 +79,18 @@ pub fn open(
 /// 校验并入库。返回 `true` 表示可以关闭对话框。
 ///
 /// 输入不合法时留在对话框里并把原因说出来——用户刚打的字不该被清掉。
-pub fn submit(
+pub fn submit<F>(
     library: &Entity<Library>,
     runner: &Entity<DiscoveryRunner>,
     input: &Entity<InputState>,
     raw: &str,
+    on_added: F,
     window: &mut Window,
     cx: &mut App,
-) -> bool {
+) -> bool
+where
+    F: Fn(&str, &mut Window, &mut App),
+{
     let Some(full_name) = parse_full_name(raw) else {
         window.push_notification(
             Notification::error("请填成 owner/repo，或直接粘贴仓库地址"),
@@ -107,6 +119,9 @@ pub fn submit(
             );
         }
         AddOutcome::Added => {
+            // 先把选中落下去：仓库已经在库里了，这一刻就能被选中。
+            on_added(&full_name, window, cx);
+
             // 手工添加的仓库没有描述和创建时间，顺手拉一次；
             // 后台任务正忙时交给后续周期补，并把这件事说出来。
             let started = runner

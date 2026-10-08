@@ -14,6 +14,7 @@ use gpui_kit::*;
 
 use crate::discovery::model::{DiscoverySource, SourceRun, validate_source_url};
 use crate::discovery::runner::{DiscoveryRunner, RunPhase};
+use crate::github::{SourcePage, tags_for_source};
 use crate::library::{AddOutcome, Library};
 use crate::shared::clock::{format_local_minute, format_relative, now_unix};
 use crate::shared::text::{copyable, copyable_as};
@@ -54,6 +55,8 @@ struct SourceRow {
     url: String,
     enabled: bool,
     last_run: Option<SourceRun>,
+    /// 这个源会给新发现的仓库自动挂上的标签。只有话题页有。
+    tags: Vec<String>,
 }
 
 impl SourceRow {
@@ -74,6 +77,15 @@ impl SourceRow {
             }
         }
     }
+
+    /// 「会自动挂上哪些标签」那一行的文字。不挂标签的源给 `None`。
+    ///
+    /// 这一行是必要的：标签是**后台悄悄挂上去**的，不说一声，用户只会看到
+    /// 「有的仓库莫名其妙带着标签」，而不知道那是哪个源跟过来的。
+    fn tags_text(&self) -> Option<String> {
+        (!self.tags.is_empty())
+            .then(|| format!("新发现的仓库会自动挂上标签：{}", self.tags.join("、")))
+    }
 }
 
 pub struct SourcesView {
@@ -93,7 +105,8 @@ impl SourcesView {
     ) -> Self {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("https://github.com/trending?since=weekly&spoken_language_code=rust")
+                // 示例只放一种页面就够：另一种（trending）在列表里已经有一条默认源写着。
+                .placeholder("https://github.com/topics/ai-agent")
                 .submit_on_enter(true)
         });
 
@@ -300,7 +313,19 @@ impl SourcesView {
                                     .text_color(palette.muted)
                                     .truncate()
                                     .child(copyable_as(format!("source-url:{url}"), url.clone())),
-                            ),
+                            )
+                            .when_some(row.tags_text(), |this, tags| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(palette.primary)
+                                        .truncate()
+                                        .child(copyable_as(
+                                            format!("source-tags:{url}"),
+                                            tags,
+                                        )),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -374,6 +399,8 @@ impl Render for SourcesView {
                 url: source.url.clone(),
                 enabled: source.enabled,
                 last_run: source.last_run.clone(),
+                // 从地址推，不存字段——话题名就在地址里（见 `github::source`）。
+                tags: tags_for_source(&source.url),
             })
             .collect();
 
@@ -493,36 +520,55 @@ impl Render for SourcesView {
 
 /// 把一个发现地址变成人看得懂的默认名称。
 ///
-/// 只有 `since` 与 `language` / `spoken_language_code` 会改变榜单口径，
-/// 所以名称只从这两处取；其它参数不影响「这是什么榜单」。
+/// 两类页面的口径不一样，所以先看是哪一类：
+/// trending 的名字由榜单的时间窗与语言决定（`since` / `spoken_language_code`），
+/// topics 的名字就是话题本身（路径里那一段），语言筛选写在 `l` 上。
 fn suggest_name(url: &str) -> String {
-    let query = url.split('?').nth(1).unwrap_or_default();
-    let mut since = None;
-    let mut language = None;
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
+    let params = query_params(url);
+
+    if let Some(SourcePage::Topic { slug }) = SourcePage::of(url) {
+        return match find_param(&params, &["l"]) {
+            Some(language) => format!("话题 · {slug} · {language}"),
+            None => format!("话题 · {slug}"),
         };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key {
-            "since" => since = Some(value.to_string()),
-            "language" | "spoken_language_code" => language = Some(value.to_string()),
-            _ => {}
-        }
     }
 
-    let window = match since.as_deref() {
+    let window = match find_param(&params, &["since"]) {
         Some("daily") => "日榜",
         Some("monthly") => "月榜",
         _ => "周榜",
     };
-    match language {
+    match find_param(&params, &["language", "spoken_language_code"]) {
         Some(language) => format!("{window} · {language}"),
         None => format!("{window} · 全部语言"),
     }
+}
+
+/// 查询串里的键值对。
+///
+/// 空值在这里就丢掉：trending 的默认地址带着一个空的 `spoken_language_code=`，
+/// 留着它会拼出「周榜 · 」这种半截名字。
+fn query_params(url: &str) -> Vec<(&str, &str)> {
+    let query = url
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or_default())
+        .unwrap_or_default();
+
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (key, value.trim()))
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .collect()
+}
+
+/// 按名字找一个参数的值。`names` 里可以放同义写法（`language` 与
+/// `spoken_language_code` 是 trending 的两种口径）。
+fn find_param<'a>(params: &[(&'a str, &'a str)], names: &[&str]) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(key, _)| names.contains(key))
+        .map(|(_, value)| *value)
 }
 
 #[cfg(test)]
@@ -557,6 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn topics_are_named_after_the_topic_itself() {
+        assert_eq!(
+            suggest_name("https://github.com/topics/ai-agent"),
+            "话题 · ai-agent"
+        );
+        // topics 的语言筛选参数是 `l`，不是 trending 的 `language`。
+        assert_eq!(
+            suggest_name("https://github.com/topics/ai-agent?l=python"),
+            "话题 · ai-agent · python"
+        );
+        // 排序参数不影响「这是什么页面」。
+        assert_eq!(
+            suggest_name("https://github.com/topics/ai-agent?l=python&o=desc&s=stars"),
+            "话题 · ai-agent · python"
+        );
+    }
+
+    #[test]
     fn last_run_text_reports_failures() {
         let row = SourceRow {
             name: "x".into(),
@@ -570,6 +634,7 @@ mod tests {
                 skipped: 22,
                 error: Some("HTTP 403".to_string()),
             }),
+            tags: Vec::new(),
         };
         let (text, failed) = row.last_run_text();
         assert!(failed);
@@ -584,7 +649,30 @@ mod tests {
             url: "u".into(),
             enabled: true,
             last_run: None,
+            tags: Vec::new(),
         };
         assert_eq!(row.last_run_text(), ("还没运行过".to_string(), false));
+    }
+
+    /// 标签是**后台悄悄挂上去**的，得在源这一行说清楚是哪个源带来的。
+    #[test]
+    fn topic_sources_say_which_tag_they_will_attach() {
+        let mut row = SourceRow {
+            name: "话题 · ai-agent".into(),
+            url: "https://github.com/topics/ai-agent".into(),
+            enabled: true,
+            last_run: None,
+            tags: Vec::new(),
+        };
+        row.tags = tags_for_source(&row.url);
+        assert_eq!(
+            row.tags_text().as_deref(),
+            Some("新发现的仓库会自动挂上标签：ai-agent")
+        );
+
+        // 榜单不挂标签，那一行就不出现。
+        row.url = "https://github.com/trending?since=weekly".into();
+        row.tags = tags_for_source(&row.url);
+        assert_eq!(row.tags_text(), None);
     }
 }

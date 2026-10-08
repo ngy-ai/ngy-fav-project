@@ -498,11 +498,21 @@ impl Library {
     }
 
     /// 加入一个仓库。已经存在时什么都不改，返回 `AlreadyPresent`。
-    pub fn add_repo(&mut self, repo: Repo) -> AddOutcome {
+    pub fn add_repo(&mut self, mut repo: Repo) -> AddOutcome {
         let id = repo.id();
         if self.repo(&id).is_some() {
             return AddOutcome::AlreadyPresent;
         }
+
+        // 词表里没有的名字挂不上去（库里只存 id），所以内存这份也要换掉：
+        // 留着它界面上会显示一个**重启就消失**的标签，而且它不在任何筛选项里，
+        // 连点都点不着。顺序也按词表来，与 `set_repo_tags` 一致。
+        repo.tags = self
+            .tags
+            .iter()
+            .filter(|tag| repo.tags.iter().any(|name| tax::same_name(name, &tag.name)))
+            .map(|tag| tag.name.clone())
+            .collect();
 
         let tag_ids = self.tag_ids_for(&repo.tags);
         let Some(inserted) = self.write(|db| db::repos::insert(db.conn(), &repo, &tag_ids)) else {
@@ -1801,6 +1811,23 @@ mod tests {
         // 仓库不存在时也不能谎报成功。
         assert!(!library.set_repo_category("z/none", Some("工具")));
         assert!(!library.set_repo_tags("z/none", &[]));
+    }
+
+    /// 入库时也认词表：挂不上的名字**内存里也不能留**。
+    ///
+    /// 库里只存标签 id，留着的那个名字重启就会消失——界面上会出现一个
+    /// 点不着（不在任何筛选项里）的标签。`set_repo_tags` 早就守住了这条，
+    /// `add_repo` 曾经没守。
+    #[test]
+    fn tags_are_kept_to_the_vocabulary_on_the_way_in() {
+        let mut library = library_with_repos("vocabulary-on-insert");
+
+        let mut repo = Repo::new("z/one".to_string(), None, 1);
+        repo.tags = vec!["CLI".to_string(), "刚编的标签".to_string()];
+        assert_eq!(library.add_repo(repo), AddOutcome::Added);
+
+        // 词表里的那个挂上（写法也换成词表里的），词表外的那个被丢掉。
+        assert_eq!(library.repo("z/one").unwrap().tags, ["cli".to_string()]);
     }
 
     #[test]

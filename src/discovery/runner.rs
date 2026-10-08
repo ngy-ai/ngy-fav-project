@@ -4,8 +4,6 @@
 //! 之所以用轮询而不是一次 `sleep(间隔)`：间隔和开关是用户随时能改的配置，
 //! 长睡眠会让改动最多等一个完整周期才生效。
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -18,6 +16,8 @@ use crate::github::rate_limit::RateLimitGate;
 use crate::library::{AddOutcome, Library};
 use crate::repos::model::Repo;
 use crate::shared::clock::{format_local_minute, now_unix};
+use crate::taxonomy::TaxonomyKind;
+use crate::taxonomy::model::same_name;
 
 /// 巡检周期。足够密（间隔改动几秒内生效），又不至于让后台空转。
 const TICK: Duration = Duration::from_secs(5);
@@ -92,6 +92,8 @@ struct RunPlan {
 struct SourcePlan {
     name: String,
     url: String,
+    /// 这个源带进来的仓库要自动挂上的标签。只有话题页有（见 `github::source`）。
+    tags: Vec<String>,
 }
 
 /// 一次巡检看到的全部依据。抽成独立结构是为了让 `decide` 能脱离
@@ -384,6 +386,7 @@ impl DiscoveryRunner {
                 .map(|source| SourcePlan {
                     name: source.name.clone(),
                     url: source.url.clone(),
+                    tags: github::tags_for_source(&source.url),
                 })
                 .collect(),
             DueKind::Metadata => Vec::new(),
@@ -427,7 +430,7 @@ async fn run_plan(this: &WeakEntity<DiscoveryRunner>, plan: RunPlan, cx: &mut As
         set_step(this, cx, format!("抓取「{}」", source.name));
 
         let started_at = now_unix();
-        match github::fetch_trending(&source.url).await {
+        match github::fetch_source(&source.url).await {
             Err(error) => {
                 errors.push(format!("{}：{error}", source.name));
                 record_run(
@@ -446,8 +449,18 @@ async fn run_plan(this: &WeakEntity<DiscoveryRunner>, plan: RunPlan, cx: &mut As
             }
             Ok(entries) => {
                 let found = entries.len();
-                let (added, skipped) = absorb(this, cx, &source.name, entries);
-                added_total += added;
+                let absorbed = absorb(this, cx, &source.name, &source.tags, entries);
+                added_total += absorbed.added;
+
+                // 标签没建进词表就是「这一轮的仓库少了标签」。不说一声，用户
+                // 只会看见「有的仓库带标签、有的没有」，而不知道是为什么。
+                if !absorbed.missing_tags.is_empty() {
+                    errors.push(format!(
+                        "{}：标签「{}」没能建进词表，这一轮新增的仓库没带上它",
+                        source.name,
+                        absorbed.missing_tags.join("、")
+                    ));
+                }
 
                 record_run(
                     this,
@@ -457,8 +470,8 @@ async fn run_plan(this: &WeakEntity<DiscoveryRunner>, plan: RunPlan, cx: &mut As
                         started_at,
                         finished_at: now_unix(),
                         found,
-                        added,
-                        skipped,
+                        added: absorbed.added,
+                        skipped: absorbed.skipped,
                         error: None,
                     },
                 );
@@ -576,39 +589,83 @@ fn set_step(this: &WeakEntity<DiscoveryRunner>, cx: &mut AsyncApp, step: impl In
     .ok();
 }
 
-/// 把一轮抓取的结果并入库，返回（新增，跳过）。
+/// 把一轮抓取的结果并入库。
 fn absorb(
     this: &WeakEntity<DiscoveryRunner>,
     cx: &mut AsyncApp,
     source_name: &str,
-    entries: Vec<github::TrendingEntry>,
-) -> (usize, usize) {
+    tags: &[String],
+    entries: Vec<github::RepoEntry>,
+) -> Absorbed {
     let source_name = source_name.to_string();
-    let added = Rc::new(Cell::new(0usize));
-    let skipped = Rc::new(Cell::new(0usize));
-    let added_out = Rc::clone(&added);
-    let skipped_out = Rc::clone(&skipped);
+    let tags = tags.to_vec();
 
     this.update(cx, move |runner, cx| {
         runner.library.update(cx, move |library, cx| {
-            let now = now_unix();
-            for entry in entries {
-                let mut repo = Repo::new(entry.full_name, Some(source_name.clone()), now);
-                repo.description = entry.description;
-                repo.language = entry.language;
-                repo.stars = entry.stars;
-
-                match library.add_repo(repo) {
-                    AddOutcome::Added => added.set(added.get() + 1),
-                    AddOutcome::AlreadyPresent => skipped.set(skipped.get() + 1),
-                }
-            }
+            let absorbed = absorb_entries(library, &source_name, &tags, entries, now_unix());
             cx.notify();
-        });
+            absorbed
+        })
     })
-    .ok();
+    // 实体已经不在了（应用正在退出）：这时候一轮的结果给谁都没意义。
+    .unwrap_or_default()
+}
 
-    (added_out.get(), skipped_out.get())
+/// 把条目逐条并入库的结果。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Absorbed {
+    added: usize,
+    skipped: usize,
+    /// 想挂上去、却没能建进词表的标签名。空表示都挂上了。
+    missing_tags: Vec<String>,
+}
+
+/// 把条目逐条并入库。
+///
+/// 与 `absorb` 那层异步外壳分开，是为了能拿一个真的库直接测「发现源自带的
+/// 标签有没有挂上」——那儿是最容易静默失灵的一步（词表里没有这个名字时，
+/// 入库只是**不挂标签**，不会报错）。
+fn absorb_entries(
+    library: &mut Library,
+    source_name: &str,
+    tags: &[String],
+    entries: Vec<github::RepoEntry>,
+    now: i64,
+) -> Absorbed {
+    let mut absorbed = Absorbed::default();
+
+    // 标签要先建进词表：`add_repo` 是拿名字去词表里换 id 的，词表里没有的名字
+    // 会被丢掉。这里走词表自己的入口（`add_name`），对已有的名字是幂等的。
+    for tag in tags {
+        library.add_name(TaxonomyKind::Tag, tag);
+        // 建不出来（名字超过词表上限、或者写库失败）就记一笔：光看列表是看不出
+        // 「这一轮的仓库少挂了一个标签」的。
+        if !library
+            .tags()
+            .iter()
+            .any(|existing| same_name(&existing.name, tag))
+        {
+            absorbed.missing_tags.push(tag.clone());
+        }
+    }
+
+    for entry in entries {
+        let mut repo = Repo::new(entry.full_name, Some(source_name.to_string()), now);
+        repo.description = entry.description;
+        repo.language = entry.language;
+        repo.stars = entry.stars;
+        // 标签是发现源自带的。只有**新入库**的会带上：已经在库里的仓库
+        // （`AlreadyPresent`）一个字段都不碰——否则用户手工摘掉的标签下一轮
+        // 又会长回来，等于删不掉。
+        repo.tags = tags.to_vec();
+
+        match library.add_repo(repo) {
+            AddOutcome::Added => absorbed.added += 1,
+            AddOutcome::AlreadyPresent => absorbed.skipped += 1,
+        }
+    }
+
+    absorbed
 }
 
 fn record_run(this: &WeakEntity<DiscoveryRunner>, cx: &mut AsyncApp, url: &str, run: SourceRun) {
@@ -849,5 +906,123 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ---- 发现源自带的标签 ----
+
+    /// 建一个只活在这条测试里的临时库。与 `library.rs` 里那份同一个套路：
+    /// 固定目录名会让第二次跑测试读到上一次写下的数据，断言就开始飘。
+    fn temp_library(name: &str) -> Library {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ngy-fav-runner-test-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Library::load_from(dir.join("library.db"))
+    }
+
+    fn repo_entry(full_name: &str) -> github::RepoEntry {
+        github::RepoEntry {
+            full_name: full_name.to_string(),
+            url: format!("https://github.com/{full_name}"),
+            description: Some("一句话说明".to_string()),
+            language: Some("Rust".to_string()),
+            stars: Some(42),
+        }
+    }
+
+    /// 从 topics 页发现的仓库要带上话题名。这是「发现源 → 标签」唯一的落点，
+    /// 也是必须测的一处：词表里没有这个名字时 `add_repo` 只是**不挂标签**，
+    /// 不报错——不测就看不出来。
+    #[test]
+    fn repos_from_a_topic_source_carry_the_topic_as_a_tag() {
+        let mut library = temp_library("auto-tag");
+        let tags = vec!["ai-agent".to_string()];
+
+        let absorbed = absorb_entries(
+            &mut library,
+            "话题 · ai-agent",
+            &tags,
+            vec![repo_entry("z/one"), repo_entry("z/two")],
+            NOW,
+        );
+
+        assert_eq!((absorbed.added, absorbed.skipped), (2, 0));
+        assert!(absorbed.missing_tags.is_empty());
+        assert_eq!(library.repo("z/one").unwrap().tags, ["ai-agent".to_string()]);
+        // 标签同时进了词表：用户能在「标签」页看到它，也能挂到别的仓库上。
+        assert!(library.tags().iter().any(|tag| tag.name == "ai-agent"));
+    }
+
+    /// 已经在库里的仓库不再补标签：否则用户手工摘掉的那个下一轮又长回来，
+    /// 等于删不掉。
+    #[test]
+    fn an_already_known_repo_keeps_the_tags_the_user_left_on_it() {
+        let mut library = temp_library("auto-tag-existing");
+        let tags = vec!["ai-agent".to_string()];
+        absorb_entries(
+            &mut library,
+            "话题 · ai-agent",
+            &tags,
+            vec![repo_entry("z/one")],
+            NOW,
+        );
+        assert!(library.set_repo_tags("z/one", &[]));
+
+        let again = absorb_entries(
+            &mut library,
+            "话题 · ai-agent",
+            &tags,
+            vec![repo_entry("z/one")],
+            NOW + 600,
+        );
+
+        assert_eq!((again.added, again.skipped), (0, 1));
+        assert!(
+            library.repo("z/one").unwrap().tags.is_empty(),
+            "摘掉的标签不该被重新挂上"
+        );
+    }
+
+    /// 标签名建不出来时要说出来。词表对名字有长度上限，而 GitHub 的话题名
+    /// 可以更长——那时候仓库照样入库，只是没带上标签。
+    #[test]
+    fn a_tag_that_cannot_be_created_is_reported() {
+        let mut library = temp_library("auto-tag-too-long");
+        let too_long = "x".repeat(crate::taxonomy::model::MAX_NAME_CHARS + 1);
+
+        let absorbed = absorb_entries(
+            &mut library,
+            "话题 · 很长",
+            std::slice::from_ref(&too_long),
+            vec![repo_entry("z/one")],
+            NOW,
+        );
+
+        assert_eq!(absorbed.missing_tags, [too_long]);
+        assert_eq!(absorbed.added, 1, "标签建不出来不该拦住仓库入库");
+        assert!(library.repo("z/one").unwrap().tags.is_empty());
+    }
+
+    /// trending 没有标签可挂：词表不该被它动过。
+    #[test]
+    fn a_source_without_tags_leaves_the_vocabulary_alone() {
+        let mut library = temp_library("auto-tag-none");
+
+        let absorbed = absorb_entries(
+            &mut library,
+            "周榜 · 全部语言",
+            &[],
+            vec![repo_entry("z/one")],
+            NOW,
+        );
+
+        assert_eq!(absorbed.added, 1);
+        assert!(absorbed.missing_tags.is_empty());
+        assert!(library.tags().is_empty());
+        assert!(library.repo("z/one").unwrap().tags.is_empty());
     }
 }

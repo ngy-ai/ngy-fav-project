@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::github::{SourcePage, UNSUPPORTED_URL_HINT};
+
 /// 一个发现地址。身份即 URL，和 `Repo` 用 `full_name` 做身份是同一套做法，
 /// 不需要再维护一个可能对不上的 id。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,8 +105,12 @@ pub fn default_sources() -> Vec<DiscoverySource> {
 /// 校验并规范化一个发现地址。
 ///
 /// GitHub Trending 的查询参数决定了榜单口径（`since`、`spoken_language_code`、
-/// `language`），这些参数必须原样保留，所以这里只做协议与主机名的检查，
+/// `language`），topics 的语言筛选在 `l` 上，这些参数必须原样保留，
+/// 所以这里只做协议、主机名与「这一页我们认不认得」的检查，
 /// 不重写路径或参数。
+///
+/// **认不出的地址在添加时就拒掉**：放它进去，只会在每一轮运行时报一句
+/// 「结构可能已经变化」，把「我们不支持这个地址」说成「GitHub 改版了」。
 pub fn validate_source_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -121,6 +127,10 @@ pub fn validate_source_url(raw: &str) -> Result<String, String> {
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if host.is_empty() {
         return Err("地址里缺少主机名".to_string());
+    }
+
+    if SourcePage::of(trimmed).is_none() {
+        return Err(format!("这个地址不是能列出仓库的页面；{UNSUPPORTED_URL_HINT}"));
     }
 
     Ok(trimmed.to_string())
@@ -166,5 +176,25 @@ mod tests {
         assert!(validate_source_url("").is_err());
         assert!(validate_source_url("github.com/trending").is_err());
         assert!(validate_source_url("https://").is_err());
+    }
+
+    #[test]
+    fn topics_urls_are_accepted_with_their_filters() {
+        let url = validate_source_url("  https://github.com/topics/ai-agent?l=python  ")
+            .expect("topics 地址合法");
+        assert_eq!(url, "https://github.com/topics/ai-agent?l=python");
+    }
+
+    /// 认不出的页面在添加时就拒掉，别留到运行时每轮报一句「结构可能已经变化」。
+    /// 报错要把支持什么说清楚，否则用户只能自己猜。
+    #[test]
+    fn pages_that_cannot_list_repositories_are_rejected() {
+        let error =
+            validate_source_url("https://github.com/explore").expect_err("应当拒绝这个地址");
+        assert!(error.contains("trending"), "错误信息该说清支持什么；实际：{error}");
+        assert!(error.contains("topics"), "错误信息该说清支持什么；实际：{error}");
+
+        assert!(validate_source_url("https://github.com/topics").is_err());
+        assert!(validate_source_url("https://gitlab.com/topics/ai-agent").is_err());
     }
 }

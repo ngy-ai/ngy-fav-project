@@ -5,7 +5,8 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IndexPath, Sizable as _, WindowExt as _,
+    h_flex, v_flex,
     button::{Button, ButtonVariants as _},
     description_list::DescriptionList,
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -326,9 +327,46 @@ impl ReposView {
 
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.input.read(cx).value().to_string();
-        if add_repo_dialog::submit(&self.library, &self.runner, &self.input, &raw, window, cx) {
+        let on_added = select_added_callback(&cx.entity().downgrade());
+        let close = add_repo_dialog::submit(
+            &self.library,
+            &self.runner,
+            &self.input,
+            &raw,
+            on_added,
+            window,
+            cx,
+        );
+        if close {
             // 提交成功后对话框会关闭，这里只需要让列表立刻反映新增项。
             self.sync_page(cx);
+        }
+    }
+
+    /// 手工加进来一个仓库之后：把它选中，并回到第一页。
+    ///
+    /// 新加的仓库 `discovered_at` 就是现在，而列表按 `discovered_at DESC,
+    /// full_name ASC` 排——**它一定落在第一页**，所以回第一页就够了；停在第 3 页
+    /// 上会看不见刚加的东西。
+    ///
+    /// 只动页码，**不碰筛选条件**：用户可能正看着某个分类，把他设的条件悄悄清掉，
+    /// 比「详情面板里是它、列表里没高亮」更让人意外。条件确实把它挡住时（新加的
+    /// 仓库既没分类也没标签），选中照样落到它身上，只是列表里没有一行可高亮。
+    fn select_added(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = Some(id.to_string());
+        self.list
+            .update(cx, |state, _| state.delegate_mut().request_page(0));
+        self.sync_page(cx);
+
+        // 页取回来之后才谈得上「它排第几行」——行号是对着**当前这一页**解释的。
+        let position = self.list.read(cx).delegate().position_of(id);
+        if let Some(row) = position {
+            self.list.update(cx, |state, cx| {
+                state.set_selected_index(Some(IndexPath::new(row)), window, cx);
+                // 连滚动一起做：列表可能停在下面别处，选中了却看不见等于没选中。
+                state.scroll_to_selected_item(window, cx);
+                cx.notify();
+            });
         }
     }
 
@@ -354,7 +392,15 @@ impl ReposView {
     }
 
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        add_repo_dialog::open(&self.input, &self.library, &self.runner, window, cx);
+        let on_added = select_added_callback(&cx.entity().downgrade());
+        add_repo_dialog::open(
+            &self.input,
+            &self.library,
+            &self.runner,
+            on_added,
+            window,
+            cx,
+        );
     }
 
     /// 把还缺字段的仓库交给后台补齐。配额有限，所以按设置里的批次上限走。
@@ -1209,6 +1255,20 @@ fn filter_label(filter: &CategoryFilter) -> String {
     }
 }
 
+/// 「加好了，把新加的那个选中」这件事的回调。
+///
+/// 对话框的「添加」按钮和输入框回车是两条路，都会经过 `add_repo_dialog::submit`，
+/// 但那里只有 `&mut App`，拿不到本视图的 `Context`——所以从视图句柄里再进去一次。
+fn select_added_callback(
+    this: &WeakEntity<ReposView>,
+) -> impl Fn(&str, &mut Window, &mut App) + Clone + 'static {
+    let this = this.clone();
+    move |id, window, cx| {
+        this.update(cx, |view, cx| view.select_added(id, window, cx))
+            .ok();
+    }
+}
+
 /// 一行在按钮上的写法：名字 + 数量。数量对筛选是有意义的——它说明点下去会看到几条。
 fn row_label(row: Option<&PickerRow>) -> Option<String> {
     row.map(|row| match row.count {
@@ -1887,5 +1947,96 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// 手工加进来的仓库要被**选中**：详情面板看它，列表里那一行高亮。
+    ///
+    /// 走的是对话框提交完之后那一步（`select_added_callback`）。`submit` 本身在这
+    /// 里调不动：它会给新仓库拉一次元数据，那是真联网。
+    #[gpui_kit::test]
+    fn a_manually_added_repo_arrives_selected_on_the_first_page(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let library = cx.new(|_| {
+            let mut library = seeded_library("added-selected");
+            // 撑出第二页（一页 50 条）：不然「回到第一页」没有可观察的后果。
+            for index in 0..51 {
+                library.add_repo(crate::repos::model::Repo::new(
+                    format!("z/r{index:02}"),
+                    None,
+                    1,
+                ));
+            }
+            library
+        });
+        let runner = cx.new(|cx| DiscoveryRunner::new(library.clone(), cx));
+        let slot: Rc<RefCell<Option<Entity<ReposView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| ReposView::new(library, runner, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+        let window_slot = || slot.borrow().clone().expect("窗口已经建好");
+
+        // 详情面板看的那个（`selected`）、列表高亮的那个（delegate 的选中）、
+        // 当前页码、以及「d/new 在第几行」——一次读齐。
+        let read = |cx: &mut TestAppContext| {
+            let view = window_slot();
+            cx.update(move |app| {
+                let view = view.read(app);
+                let delegate = view.list.read(app).delegate();
+                (
+                    view.selected.clone(),
+                    delegate.selection().cloned(),
+                    delegate.page().page,
+                    delegate.position_of("d/new"),
+                )
+            })
+        };
+
+        // 先站到第二页上，这样「回第一页」才看得出效果。
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window_slot();
+            view.update(cx, |view, cx| view.turn_page(true, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(read(cx).2, 1, "先翻到第二页");
+
+        // 加一个（这一步由对话框做），再走「加完了」这一步。
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window_slot();
+            view.update(cx, |view, cx| {
+                view.library.update(cx, |library, cx| {
+                    library.add_repo(crate::repos::model::Repo::new(
+                        "d/new".to_string(),
+                        None,
+                        now_unix(),
+                    ));
+                    cx.notify();
+                });
+                cx.notify();
+            });
+            select_added_callback(&view.downgrade())("d/new", window, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let (selected, selection, page, position) = read(cx);
+        assert_eq!(selection.as_deref(), Some("d/new"), "加进来就该被选中");
+        assert_eq!(
+            selected.as_deref(),
+            Some("d/new"),
+            "详情面板看的也得是它——这才是「选中」"
+        );
+        assert_eq!(
+            position,
+            Some(0),
+            "它是最新的，按发现时间倒序排在第一页第一行"
+        );
+        assert_eq!(page, 0, "得把它拽回第一页来，不然加完了看不见");
     }
 }

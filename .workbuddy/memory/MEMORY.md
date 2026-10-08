@@ -18,6 +18,32 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
   途中改设置不影响本轮。
 - **`shared/store.rs` 只管「数据放哪」**，读写归 `src/db/`。
 
+## 发现源与解析（`src/github/` + `src/discovery/`）
+
+- **发现源的身份就是 URL**，指向哪一类页面完全从地址形状推（`github/source.rs::SourcePage`
+  = `Trending` | `Topic { slug }`），**不额外持久化「类型」字段**——存了就会出现「改了地址
+  忘了改类型」，然后拿 trending 的选择器去套 topics 页面。**加一类页面要同时动三处**：
+  `SourcePage::of`（认不认）、`discovery::model::validate_source_url`（添加时就拒掉认不出的
+  地址，别留到运行时每轮报「结构可能已经变化」）、`sources_view::suggest_name`（默认名字口径）。
+- 两类页面 DOM 互不相干，解析器分开（`trending.rs` / `topic.rs`）；**条目形状与取文本的工具
+  共用 `entry.rs`**（`RepoEntry` / `repo_from_href` / `parse_count` / `element_text`），
+  别在两个解析器里各写一份。**解析出 0 条一律 `Err`**，空 `Vec` 会被读成「本轮无新项目」。
+- **发现源自带的标签也从地址推**（`source::tags_for_source`：topics → `[slug]`，trending → 空），
+  **没有「源 → 标签」映射表**。落点是 `runner::absorb_entries`：标签**先 `add_name` 建进词表**
+  （`add_repo` 是拿名字换 id，词表外的名字被静默丢掉），再挂到**这一轮新入库**的仓库上
+  （`AlreadyPresent` 的一个字段都不碰，否则用户摘掉的标签下一轮会长回来）。建不出来要报错。
+  **`add_repo` 会把 `repo.tags` 按词表过滤并换成词表里的写法**——它不替你建名字，只保证
+  内存镜像里不会留一个「库里没有、重启就消失、还点不着」的标签。
+- **别拿 `tmp-` 前缀的工具类当选择器**：GitHub 正把 `mr-3` / `px-3` 逐个改成 `tmp-mr-3` /
+  `tmp-px-3`，同一张卡片上两种混着出现。靠结构（`article` / `h3` / `p`）与语义标记
+  （`itemprop="programmingLanguage"`、`js-social-count`）更稳。
+- topics 卡片的**星数计数器显示的是缩写**（`248k`），完整数字只在 `title` / `aria-label` 上；
+  直接读文本会得到一个**看着像真数据的错数**。trending 的星标链接写的是完整数字。
+- topics 卡片下方那排 tab（Code / Issues / Pull requests）里 `Code` 也指向 `/owner/repo`，
+  **仓库链接必须限定在 `h3` 里**，否则每张卡片解析出两条。
+- **改选择器时另拿一份整页 HTML 自己过一遍**：单测里的真实片段只能证明选择器写对了，
+  证明不了它在整页上不会多匹配。抓样本用 `curl -sL -A "<浏览器 UA>"`。
+
 ## 存储（`src/db/`）
 
 - 读表收 `&Connection`（入口 `Db::open` / `open_in_memory`），事务用 `Db::transaction`
@@ -93,7 +119,15 @@ GitHub 仓库收藏/发现桌面程序，gpui-kit（实际 0.6.4）。完整说�
   内存镜像一趟遍历改完，别逐个 `find`。
 - **批量对话框的 `on_saved` 是回调**（`F: Fn(&mut App) + Clone + 'static`）：对话框不该认识列表，
   而「保存完把勾选清掉」得由列表自己做。`open_dialog` 的 builder 是 `Fn`、每帧都调，
-  所以捕获的东西必须 `Clone`。
+  所以捕获的东西必须 `Clone`。**`add_repo_dialog` 的 `on_added` 同一套路**（多一个
+  `&mut Window`，因为要调 `ListState::set_selected_index` / `scroll_to_selected_item`）。
+- **列表的选中按「行号」记**（`ListState::set_selected_index`，行号只对当前这一页有意义），
+  而视图对外说的是 id：**按 id 选中要先用 `delegate.position_of(id)` 换算行号**，换不到
+  （被筛掉了）就只把 `delegate.set_selected(Some(id))` 落下去——详情面板照样看它，列表里
+  没有一行可高亮。**手工添加完的那个仓库也要这样选中**（`ReposView::select_added`：
+  回第一页 → 取回那一页 → 换算行号 → 选中并滚到它；**不碰筛选条件**）。
+- **测「加完要选中」别走 `add_repo_dialog::submit`**：它会给新仓库拉一次元数据（真联网）。
+  直接调它交出去的那一步（`select_added_callback`）。
 
 ## 界面（只记项目里定下来的，通用套路见技能）
 
